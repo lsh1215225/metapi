@@ -216,6 +216,36 @@ describe('resolveUpstreamEndpointCandidates', () => {
     expect(order).toEqual(['responses', 'chat', 'messages']);
   });
 
+  it('keeps learned endpoint state scoped to the model key', async () => {
+    recordUpstreamEndpointSuccess({
+      siteId: baseContext.site.id,
+      endpoint: 'responses',
+      downstreamFormat: 'openai',
+      modelName: 'gpt-5.3',
+    });
+
+    const learnedOrder = await resolveUpstreamEndpointCandidates(
+      {
+        ...baseContext,
+        site: { ...baseContext.site, platform: 'new-api' },
+      },
+      'gpt-5.3',
+      'openai',
+    );
+
+    const unrelatedModelOrder = await resolveUpstreamEndpointCandidates(
+      {
+        ...baseContext,
+        site: { ...baseContext.site, platform: 'new-api' },
+      },
+      'gpt-4.1',
+      'openai',
+    );
+
+    expect(learnedOrder).toEqual(['responses', 'chat', 'messages']);
+    expect(unrelatedModelOrder).toEqual(['chat', 'messages', 'responses']);
+  });
+
   it('learns a better endpoint from explicit upstream protocol errors', async () => {
     recordUpstreamEndpointFailure({
       siteId: baseContext.site.id,

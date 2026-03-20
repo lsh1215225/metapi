@@ -40,6 +40,7 @@ export type UpstreamEndpoint = 'chat' | 'messages' | 'responses';
 export type EndpointPreference = DownstreamFormat | 'responses';
 
 type EndpointCapabilityProfile = {
+  modelKey: string;
   preferMessagesForClaudeModel: boolean;
   hasNonImageFileInput: boolean;
   wantsNativeResponsesReasoning: boolean;
@@ -75,6 +76,14 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function asTrimmedString(value: unknown): string {
   return typeof value === 'string' ? value.trim() : '';
+}
+
+function normalizeEndpointRuntimeModelKey(...values: Array<unknown>): string {
+  for (const value of values) {
+    const normalized = asTrimmedString(value).toLowerCase();
+    if (normalized) return normalized;
+  }
+  return 'unknown-model';
 }
 
 function resolveRequestedModelForPayloadRules(input: {
@@ -611,6 +620,7 @@ function buildEndpointCapabilityProfile(input?: {
   };
 }): EndpointCapabilityProfile {
   return {
+    modelKey: normalizeEndpointRuntimeModelKey(input?.modelName, input?.requestedModelHint),
     preferMessagesForClaudeModel: (
       isClaudeFamilyModel(asTrimmedString(input?.modelName))
       || isClaudeFamilyModel(asTrimmedString(input?.requestedModelHint))
@@ -632,7 +642,7 @@ function buildEndpointRuntimeStateKey(input: {
   return [
     String(input.siteId),
     input.downstreamFormat,
-    capabilityProfile.preferMessagesForClaudeModel ? 'claude' : 'generic',
+    capabilityProfile.modelKey,
     capabilityProfile.hasNonImageFileInput ? 'files' : 'nofiles',
     capabilityProfile.wantsNativeResponsesReasoning ? 'reasoning' : 'noreasoning',
   ].join(':');

@@ -542,7 +542,7 @@ export async function geminiProxyRoute(app: FastifyInstance) {
               : upstreamReader;
             if (!reader) {
               const latency = Date.now() - startTime;
-              await tokenRouter.recordSuccess?.(selected.channel.id, latency, 0);
+              await tokenRouter.recordSuccess?.(selected.channel.id, latency, 0, actualModel);
               await logProxy(
                 selected,
                 requestedModel,
@@ -592,7 +592,7 @@ export async function geminiProxyRoute(app: FastifyInstance) {
             }
             const parsedUsage = parseProxyUsage(aggregateState);
             const latency = Date.now() - startTime;
-            await tokenRouter.recordSuccess?.(selected.channel.id, latency, 0);
+            await tokenRouter.recordSuccess?.(selected.channel.id, latency, 0, actualModel);
             await logProxy(
               selected,
               requestedModel,
@@ -628,7 +628,7 @@ export async function geminiProxyRoute(app: FastifyInstance) {
               );
             parsedUsage = parseProxyUsage(aggregateState);
             const latency = Date.now() - startTime;
-            await tokenRouter.recordSuccess?.(selected.channel.id, latency, 0);
+            await tokenRouter.recordSuccess?.(selected.channel.id, latency, 0, actualModel);
             await logProxy(
               selected,
               requestedModel,
@@ -651,7 +651,7 @@ export async function geminiProxyRoute(app: FastifyInstance) {
             );
           } catch {
             const latency = Date.now() - startTime;
-            await tokenRouter.recordSuccess?.(selected.channel.id, latency, 0);
+            await tokenRouter.recordSuccess?.(selected.channel.id, latency, 0, actualModel);
             await logProxy(
               selected,
               requestedModel,
@@ -827,7 +827,7 @@ export async function geminiProxyRoute(app: FastifyInstance) {
           },
         });
         const latency = Date.now() - startTime;
-        await tokenRouter.recordSuccess?.(selected.channel.id, latency, 0);
+        await tokenRouter.recordSuccess?.(selected.channel.id, latency, 0, actualModel);
         await logProxy(
           selected,
           requestedModel,

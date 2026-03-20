@@ -59,7 +59,8 @@ export async function imagesProxyRoute(app: FastifyInstance) {
       excludeChannelIds.push(selected.channel.id);
 
       const targetUrl = buildUpstreamUrl(selected.site.url, '/v1/images/generations');
-      const forwardBody = { ...body, model: selected.actualModel };
+      const upstreamModel = selected.actualModel || requestedModel;
+      const forwardBody = { ...body, model: upstreamModel };
       const startTime = Date.now();
 
       try {
@@ -74,10 +75,10 @@ export async function imagesProxyRoute(app: FastifyInstance) {
 
         const text = await upstream.text();
         if (!upstream.ok) {
-          tokenRouter.recordFailure(selected.channel.id, {
+          await tokenRouter.recordFailure(selected.channel.id, {
             status: upstream.status,
             errorText: text,
-            modelName: selected.actualModel,
+            modelName: upstreamModel,
           });
           logProxy(
             selected,
@@ -118,20 +119,20 @@ export async function imagesProxyRoute(app: FastifyInstance) {
         const estimatedCost = await estimateProxyCost({
           site: selected.site,
           account: selected.account,
-          modelName: selected.actualModel || requestedModel,
+          modelName: upstreamModel,
           promptTokens: 0,
           completionTokens: 0,
           totalTokens: 0,
         });
-        tokenRouter.recordSuccess(selected.channel.id, latency, estimatedCost, selected.actualModel);
+        await tokenRouter.recordSuccess(selected.channel.id, latency, estimatedCost, upstreamModel);
         recordDownstreamCostUsage(request, estimatedCost);
         logProxy(selected, requestedModel, 'success', upstream.status, latency, null, retryCount, downstreamApiKeyId, estimatedCost, downstreamPath, clientContext);
         return reply.code(upstream.status).send(data);
       } catch (err: any) {
-        tokenRouter.recordFailure(selected.channel.id, {
+        await tokenRouter.recordFailure(selected.channel.id, {
           status: 0,
           errorText: err.message,
-          modelName: selected.actualModel,
+          modelName: upstreamModel,
         });
         logProxy(
           selected,
@@ -204,6 +205,7 @@ export async function imagesProxyRoute(app: FastifyInstance) {
 
       excludeChannelIds.push(selected.channel.id);
       const targetUrl = buildUpstreamUrl(selected.site.url, '/v1/images/edits');
+      const upstreamModel = selected.actualModel || requestedModel;
       const startTime = Date.now();
 
       try {
@@ -214,7 +216,7 @@ export async function imagesProxyRoute(app: FastifyInstance) {
               Authorization: `Bearer ${selected.tokenValue}`,
             },
             body: cloneFormDataWithOverrides(multipartForm, {
-              model: selected.actualModel || requestedModel,
+              model: upstreamModel,
             }) as any,
           })
           : withSiteRecordProxyRequestInit(selected.site, {
@@ -225,17 +227,17 @@ export async function imagesProxyRoute(app: FastifyInstance) {
             },
             body: JSON.stringify({
               ...(jsonBody || {}),
-              model: selected.actualModel || requestedModel,
+              model: upstreamModel,
             }),
           });
 
         const upstream = await fetch(targetUrl, requestInit);
         const text = await upstream.text();
         if (!upstream.ok) {
-          tokenRouter.recordFailure(selected.channel.id, {
+          await tokenRouter.recordFailure(selected.channel.id, {
             status: upstream.status,
             errorText: text,
-            modelName: selected.actualModel,
+            modelName: upstreamModel,
           });
           logProxy(
             selected,
@@ -276,20 +278,20 @@ export async function imagesProxyRoute(app: FastifyInstance) {
         const estimatedCost = await estimateProxyCost({
           site: selected.site,
           account: selected.account,
-          modelName: selected.actualModel || requestedModel,
+          modelName: upstreamModel,
           promptTokens: 0,
           completionTokens: 0,
           totalTokens: 0,
         });
-        tokenRouter.recordSuccess(selected.channel.id, latency, estimatedCost, selected.actualModel);
+        await tokenRouter.recordSuccess(selected.channel.id, latency, estimatedCost, upstreamModel);
         recordDownstreamCostUsage(request, estimatedCost);
         logProxy(selected, requestedModel, 'success', upstream.status, latency, null, retryCount, downstreamApiKeyId, estimatedCost, downstreamPath, clientContext);
         return reply.code(upstream.status).send(data);
       } catch (err: any) {
-        tokenRouter.recordFailure(selected.channel.id, {
+        await tokenRouter.recordFailure(selected.channel.id, {
           status: 0,
           errorText: err.message,
-          modelName: selected.actualModel,
+          modelName: upstreamModel,
         });
         logProxy(
           selected,

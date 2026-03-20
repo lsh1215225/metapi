@@ -29,6 +29,10 @@ import type {
 import type { RouteCandidateView, RouteTokenOption } from '../helpers/routeModelCandidatesIndex.js';
 import { SortableChannelRow } from './SortableChannelRow.js';
 import {
+  getRouteRoutingStrategyLabel,
+  normalizeRouteRoutingStrategyValue,
+} from './routingStrategy.js';
+import {
   isRouteExactModel,
   isExplicitGroupRoute,
   resolveRouteTitle,
@@ -71,18 +75,6 @@ type RouteCardProps = {
   expandedSourceGroupMap: Record<string, boolean>;
   onToggleSourceGroup: (groupKey: string) => void;
 };
-
-function normalizeRoutingStrategy(value?: RouteRoutingStrategy | null): RouteRoutingStrategy {
-  if (value === 'round_robin' || value === 'stable_first') return value;
-  return 'weighted';
-}
-
-function getRoutingStrategyLabel(value?: RouteRoutingStrategy | null): string {
-  const strategy = normalizeRoutingStrategy(value);
-  if (strategy === 'round_robin') return tr('轮询');
-  if (strategy === 'stable_first') return tr('稳定优先');
-  return tr('权重随机');
-}
 
 function AnimatedCollapseSection({ open, children }: { open: boolean; children: ReactNode }) {
   const presence = useAnimatedVisibility(open, 220);
@@ -132,7 +124,7 @@ function RouteCardInner({
   const readOnlyRoute = route.kind === 'zero_channel' || route.readOnly === true || route.isVirtual === true;
   const channelManagementDisabled = explicitGroupRoute;
   const title = resolveRouteTitle(route);
-  const routingStrategy = normalizeRoutingStrategy(route.routingStrategy);
+  const routingStrategy = normalizeRouteRoutingStrategyValue(route.routingStrategy);
   const routingStrategyOptions = [
     {
       value: 'weighted',
@@ -245,7 +237,7 @@ function RouteCardInner({
             </span>
           ) : (
             <span className="badge badge-muted" style={{ fontSize: 10, flexShrink: 0 }}>
-              {getRoutingStrategyLabel(routingStrategy)}
+              {getRouteRoutingStrategyLabel(routingStrategy)}
             </span>
           )}
 

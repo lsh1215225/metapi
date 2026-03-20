@@ -72,6 +72,7 @@ export async function videosProxyRoute(app: FastifyInstance) {
 
       excludeChannelIds.push(selected.channel.id);
       const targetUrl = buildUpstreamUrl(selected.site.url, '/v1/videos');
+      const upstreamModel = selected.actualModel || requestedModel;
       const startTime = Date.now();
 
       try {
@@ -82,7 +83,7 @@ export async function videosProxyRoute(app: FastifyInstance) {
               Authorization: `Bearer ${selected.tokenValue}`,
             },
             body: cloneFormDataWithOverrides(multipartForm, {
-              model: selected.actualModel || requestedModel,
+              model: upstreamModel,
             }) as any,
           })
           : withSiteRecordProxyRequestInit(selected.site, {
@@ -93,14 +94,18 @@ export async function videosProxyRoute(app: FastifyInstance) {
             },
             body: JSON.stringify({
               ...(jsonBody || {}),
-              model: selected.actualModel || requestedModel,
+              model: upstreamModel,
             }),
           });
 
         const upstream = await fetch(targetUrl, requestInit);
         const text = await upstream.text();
         if (!upstream.ok) {
-          tokenRouter.recordFailure(selected.channel.id, selected.actualModel);
+          await tokenRouter.recordFailure(selected.channel.id, {
+            status: upstream.status,
+            errorText: text,
+            modelName: upstreamModel,
+          });
           if (isTokenExpiredError({ status: upstream.status, message: text })) {
             await reportTokenExpired({
               accountId: selected.account.id,
@@ -134,7 +139,7 @@ export async function videosProxyRoute(app: FastifyInstance) {
           siteUrl: selected.site.url,
           tokenValue: selected.tokenValue,
           requestedModel,
-          actualModel: selected.actualModel || requestedModel,
+          actualModel: upstreamModel,
           channelId: typeof selected.channel.id === 'number' ? selected.channel.id : null,
           accountId: typeof selected.account.id === 'number' ? selected.account.id : null,
           statusSnapshot: data,
@@ -148,16 +153,20 @@ export async function videosProxyRoute(app: FastifyInstance) {
         const estimatedCost = await estimateProxyCost({
           site: selected.site,
           account: selected.account,
-          modelName: selected.actualModel || requestedModel,
+          modelName: upstreamModel,
           promptTokens: 0,
           completionTokens: 0,
           totalTokens: 0,
         });
-        tokenRouter.recordSuccess(selected.channel.id, latency, estimatedCost, selected.actualModel);
+        await tokenRouter.recordSuccess(selected.channel.id, latency, estimatedCost, upstreamModel);
         recordDownstreamCostUsage(request, estimatedCost);
         return reply.code(upstream.status).send(rewriteVideoResponsePublicId(data, mapping.publicId));
       } catch (error: any) {
-        tokenRouter.recordFailure(selected.channel.id, selected.actualModel);
+        await tokenRouter.recordFailure(selected.channel.id, {
+          status: 0,
+          errorText: error?.message || 'network failure',
+          modelName: upstreamModel,
+        });
         if (retryCount < MAX_RETRIES) {
           retryCount += 1;
           continue;

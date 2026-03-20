@@ -495,7 +495,9 @@ function scheduleSiteRuntimeHealthPersistence(): void {
   if (siteRuntimeHealthSaveTimer) return;
   siteRuntimeHealthSaveTimer = setTimeout(() => {
     siteRuntimeHealthSaveTimer = null;
-    void persistSiteRuntimeHealthState();
+    void persistSiteRuntimeHealthState().catch((error) => {
+      console.error('Failed to persist site runtime health state', error);
+    });
   }, SITE_RUNTIME_HEALTH_PERSIST_DEBOUNCE_MS);
 }
 
@@ -550,8 +552,10 @@ async function ensureSiteRuntimeHealthStateLoaded(): Promise<void> {
     siteRuntimeHealthLoadPromise = (async () => {
       try {
         await loadSiteRuntimeHealthStateFromSettings();
-      } finally {
         siteRuntimeHealthLoaded = true;
+      } catch (error) {
+        siteRuntimeHealthLoadPromise = null;
+        throw error;
       }
     })();
   }

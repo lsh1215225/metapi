@@ -164,6 +164,7 @@ export async function handleChatSurfaceRequest(
       requestedModelHint: requestedModel,
       requestCapabilities: {
         hasNonImageFileInput,
+        conversationFileSummary,
       },
     };
     const buildProviderHeaders = () => (
@@ -247,6 +248,8 @@ export async function handleChatSurfaceRequest(
             return {
               upstream: refreshedResponse,
               upstreamPath: refreshedRequest.path,
+              request: refreshedRequest,
+              targetUrl: refreshedTargetUrl,
             };
           }
           ctx.request = refreshedRequest;

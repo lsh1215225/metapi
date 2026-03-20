@@ -86,10 +86,11 @@ export async function searchProxyRoute(app: FastifyInstance) {
 
       excludeChannelIds.push(selected.channel.id);
       const targetUrl = buildUpstreamUrl(selected.site.url, '/v1/search');
+      const upstreamModel = selected.actualModel || requestedModel;
       const forwardBody = {
         ...body,
         max_results: maxResults,
-        model: selected.actualModel || requestedModel,
+        model: upstreamModel,
       };
       const startTime = Date.now();
 
@@ -105,10 +106,10 @@ export async function searchProxyRoute(app: FastifyInstance) {
 
         const text = await upstream.text();
         if (!upstream.ok) {
-          tokenRouter.recordFailure(selected.channel.id, {
+          await tokenRouter.recordFailure(selected.channel.id, {
             status: upstream.status,
             errorText: text,
-            modelName: selected.actualModel,
+            modelName: upstreamModel,
           });
           logProxy(
             selected,
@@ -145,15 +146,15 @@ export async function searchProxyRoute(app: FastifyInstance) {
         try { data = JSON.parse(text); } catch { data = { data: [] }; }
 
         const latency = Date.now() - startTime;
-        tokenRouter.recordSuccess(selected.channel.id, latency, 0, selected.actualModel);
+        await tokenRouter.recordSuccess(selected.channel.id, latency, 0, upstreamModel);
         recordDownstreamCostUsage(request, 0);
         logProxy(selected, requestedModel, 'success', upstream.status, latency, null, retryCount, downstreamApiKeyId, clientContext, downstreamPath);
         return reply.code(upstream.status).send(data);
       } catch (error: any) {
-        tokenRouter.recordFailure(selected.channel.id, {
+        await tokenRouter.recordFailure(selected.channel.id, {
           status: 0,
           errorText: error?.message || 'network error',
-          modelName: selected.actualModel,
+          modelName: upstreamModel,
         });
         logProxy(
           selected,

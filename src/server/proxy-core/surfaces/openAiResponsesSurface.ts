@@ -272,6 +272,7 @@ export async function handleOpenAiResponsesSurfaceRequest(
         requestedModelHint: requestedModel,
         requestCapabilities: {
           hasNonImageFileInput,
+          conversationFileSummary,
           wantsNativeResponsesReasoning: prefersNativeResponsesReasoning,
         },
       };
@@ -347,6 +348,8 @@ export async function handleOpenAiResponsesSurfaceRequest(
               return {
                 upstream: refreshedResponse,
                 upstreamPath: refreshedRequest.path,
+                request: refreshedRequest,
+                targetUrl: refreshedTargetUrl,
               };
             }
             ctx.request = refreshedRequest;

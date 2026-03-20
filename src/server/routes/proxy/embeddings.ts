@@ -60,7 +60,8 @@ export async function embeddingsProxyRoute(app: FastifyInstance) {
       excludeChannelIds.push(selected.channel.id);
 
       const targetUrl = buildUpstreamUrl(selected.site.url, '/v1/embeddings');
-      const forwardBody = { ...body, model: selected.actualModel };
+      const upstreamModel = selected.actualModel || requestedModel;
+      const forwardBody = { ...body, model: upstreamModel };
       const startTime = Date.now();
 
       try {
@@ -75,10 +76,10 @@ export async function embeddingsProxyRoute(app: FastifyInstance) {
 
         const text = await upstream.text();
         if (!upstream.ok) {
-          tokenRouter.recordFailure(selected.channel.id, {
+          await tokenRouter.recordFailure(selected.channel.id, {
             status: upstream.status,
             errorText: text,
-            modelName: selected.actualModel,
+            modelName: upstreamModel,
           });
           logProxy(
             selected,
@@ -146,7 +147,7 @@ export async function embeddingsProxyRoute(app: FastifyInstance) {
           resolvedUsage,
         });
 
-        tokenRouter.recordSuccess(selected.channel.id, latency, estimatedCost, selected.actualModel);
+        await tokenRouter.recordSuccess(selected.channel.id, latency, estimatedCost, upstreamModel);
         recordDownstreamCostUsage(request, estimatedCost);
         logProxy(
           selected, requestedModel, 'success', upstream.status, latency, null, retryCount, downstreamApiKeyId,
@@ -154,10 +155,10 @@ export async function embeddingsProxyRoute(app: FastifyInstance) {
         );
         return reply.code(upstream.status).send(data);
       } catch (err: any) {
-        tokenRouter.recordFailure(selected.channel.id, {
+        await tokenRouter.recordFailure(selected.channel.id, {
           status: 0,
           errorText: err.message,
-          modelName: selected.actualModel,
+          modelName: upstreamModel,
         });
         logProxy(
           selected,

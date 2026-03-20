@@ -66,14 +66,20 @@ require_cmd docker
 require_cmd tar
 require_cmd git
 require_file "$COMPOSE_FILE"
-require_file "$COMPOSE_OVERRIDE_FILE"
 require_file "$ENV_FILE"
 
 COMPOSE_ARGS=(
   -f "$COMPOSE_FILE"
-  -f "$COMPOSE_OVERRIDE_FILE"
   --env-file "$ENV_FILE"
 )
+
+if [ -f "$COMPOSE_OVERRIDE_FILE" ]; then
+  COMPOSE_ARGS=(
+    -f "$COMPOSE_FILE"
+    -f "$COMPOSE_OVERRIDE_FILE"
+    --env-file "$ENV_FILE"
+  )
+fi
 
 if [ "$DO_PULL" -eq 1 ]; then
   echo "[0/5] Checking git worktree..."
@@ -89,29 +95,29 @@ else
 fi
 
 BACKUP_FILE=""
+if [ "$DO_PULL" -eq 1 ]; then
+  echo "[2/5] Stopping current containers..."
+else
+  echo "[2/4] Stopping current containers..."
+fi
+docker compose "${COMPOSE_ARGS[@]}" down --remove-orphans
+
 if [ "$SKIP_BACKUP" -eq 0 ]; then
   mkdir -p "$DATA_DIR"
   BACKUP_FILE="$ROOT_DIR/docker/data-backup-$(date +%Y%m%d-%H%M%S).tar.gz"
   if [ "$DO_PULL" -eq 1 ]; then
-    echo "[2/5] Backing up data directory..."
+    echo "[3/5] Backing up data directory..."
   else
-    echo "[2/4] Backing up data directory..."
+    echo "[3/4] Backing up data directory..."
   fi
   tar -czf "$BACKUP_FILE" -C "$DATA_DIR" .
 else
   if [ "$DO_PULL" -eq 1 ]; then
-    echo "[2/5] Skipping data backup by request..."
+    echo "[3/5] Skipping data backup by request..."
   else
-    echo "[2/4] Skipping data backup by request..."
+    echo "[3/4] Skipping data backup by request..."
   fi
 fi
-
-if [ "$DO_PULL" -eq 1 ]; then
-  echo "[3/5] Stopping current containers..."
-else
-  echo "[3/4] Stopping current containers..."
-fi
-docker compose "${COMPOSE_ARGS[@]}" down --remove-orphans
 
 if [ "$DO_PULL" -eq 1 ]; then
   echo "[4/5] Rebuilding and starting containers..."

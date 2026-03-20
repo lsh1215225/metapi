@@ -34,7 +34,7 @@ const RETRYABLE_CHANNEL_LOCAL_PATTERNS: RegExp[] = [
   /gateway\s+time-?out/i,
   /service\s+unavailable/i,
   /cpu\s+overloaded/i,
-  /timeout/i,
+  /(request timed out|connection timed out|read timeout|\btimed out\b)/i,
 ];
 
 const NON_RETRYABLE_REQUEST_PATTERNS: RegExp[] = [
