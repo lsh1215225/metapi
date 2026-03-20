@@ -346,7 +346,7 @@ function RouteCardInner({
 
       {explicitGroupRoute ? (
         <div style={{ fontSize: 12, color: 'var(--color-text-muted)', marginBottom: 10 }}>
-          {tr('该群组会将多个来源模型聚合为一个对外模型名；通道信息继承自来源模型，当前仅支持查看，不支持直接维护。')}
+          {tr('该群组会将多个来源模型聚合为一个对外模型名；当前策略以群组设置为准，来源模型会尽量跟随同步，但已单独自定义或被其他群组复用的来源模型不会被覆盖。')}
         </div>
       ) : !exactRoute ? (
         <div style={{ fontSize: 12, color: 'var(--color-text-muted)', marginBottom: 10 }}>
