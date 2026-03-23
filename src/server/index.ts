@@ -22,6 +22,8 @@ import { oauthRoutes } from './routes/api/oauth.js';
 import { siteAnnouncementsRoutes } from './routes/api/siteAnnouncements.js';
 import { proxyRoutes } from './routes/proxy/router.js';
 import { startScheduler } from './services/checkinScheduler.js';
+import { rebuildTokenRoutesFromAvailability } from './services/modelService.js';
+import { startProxyFileRetentionService, stopProxyFileRetentionService } from './services/proxyFileRetentionService.js';
 import { setLegacyProxyLogRetentionFallbackEnabled, stopProxyLogRetentionService } from './services/proxyLogRetentionService.js';
 import { buildStartupSummaryLines } from './services/startupInfo.js';
 import { repairStoredCreatedAtValues } from './services/storedTimestampRepairService.js';
@@ -29,6 +31,7 @@ import { migrateSiteApiKeysToAccounts } from './services/siteApiKeyMigrationServ
 import { ensureDefaultSitesSeeded } from './services/defaultSiteSeedService.js';
 import { startOAuthLoopbackCallbackServers, stopOAuthLoopbackCallbackServers } from './services/oauth/localCallbackServer.js';
 import { startSiteAnnouncementPolling } from './services/siteAnnouncementPollingService.js';
+import { reloadBackupWebdavScheduler } from './services/backupService.js';
 import { ensureRuntimeDatabaseReady } from './runtimeDatabaseBootstrap.js';
 import { isPublicApiRoute, registerDesktopRoutes } from './desktop.js';
 import { existsSync } from 'fs';
@@ -141,6 +144,11 @@ function applyRuntimeSettings(settingsMap: Map<string, string>) {
   const proxyEmptyContentFailEnabled = parseSettingFromMap<boolean>(settingsMap, 'proxy_empty_content_fail_enabled');
   if (typeof proxyEmptyContentFailEnabled === 'boolean') {
     config.proxyEmptyContentFailEnabled = proxyEmptyContentFailEnabled;
+  }
+
+  const globalBlockedBrands = parseSettingFromMap<string[]>(settingsMap, 'global_blocked_brands');
+  if (Array.isArray(globalBlockedBrands)) {
+    config.globalBlockedBrands = globalBlockedBrands.filter((b): b is string => typeof b === 'string').map((b) => b.trim()).filter(Boolean);
   }
 
   const codexHeaderDefaults = parseSettingFromMap<unknown>(settingsMap, 'codex_header_defaults');
@@ -329,6 +337,7 @@ try {
   await repairStoredCreatedAtValues();
   await migrateSiteApiKeysToAccounts();
   await ensureDefaultSitesSeeded();
+  await rebuildTokenRoutesFromAvailability();
 
   console.log('Loaded runtime settings overrides');
 } catch (error) {
@@ -397,6 +406,7 @@ if (existsSync(webDir)) {
 
 // Start scheduler
 await startScheduler();
+await reloadBackupWebdavScheduler();
 startSiteAnnouncementPolling();
 try {
   await startOAuthLoopbackCallbackServers();
@@ -404,7 +414,9 @@ try {
   console.warn(`Failed to start OAuth callback listeners: ${(error as Error)?.message || 'unknown error'}`);
 }
 setLegacyProxyLogRetentionFallbackEnabled(!config.logCleanupConfigured);
+startProxyFileRetentionService();
 app.addHook('onClose', async () => {
+  stopProxyFileRetentionService();
   stopProxyLogRetentionService();
   await stopOAuthLoopbackCallbackServers();
 });

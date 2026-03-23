@@ -9,6 +9,7 @@ import { resolveProxyUsageWithSelfLogFallback } from '../../services/proxyUsageF
 import { parseProxyUsage } from '../../services/proxyUsageParser.js';
 import { ensureModelAllowedForDownstreamKey, getDownstreamRoutingPolicy, recordDownstreamCostUsage } from './downstreamPolicy.js';
 import { withSiteRecordProxyRequestInit } from '../../services/siteProxy.js';
+import { getProxyUrlFromExtraConfig } from '../../services/accountExtraConfig.js';
 import { composeProxyLogMessage } from './logPathMeta.js';
 import { formatUtcSqlDateTime } from '../../services/localTimeService.js';
 import { resolveProxyLogBilling } from './proxyBilling.js';
@@ -56,7 +57,6 @@ export async function embeddingsProxyRoute(app: FastifyInstance) {
         });
         return reply.code(503).send({ error: { message: 'No available channels', type: 'server_error' } });
       }
-
       excludeChannelIds.push(selected.channel.id);
 
       const targetUrl = buildUpstreamUrl(selected.site.url, '/v1/embeddings');
@@ -72,7 +72,7 @@ export async function embeddingsProxyRoute(app: FastifyInstance) {
             'Authorization': `Bearer ${selected.tokenValue}`,
           },
           body: JSON.stringify(forwardBody),
-        }));
+        }, getProxyUrlFromExtraConfig(selected.account.extraConfig)));
 
         const text = await upstream.text();
         if (!upstream.ok) {

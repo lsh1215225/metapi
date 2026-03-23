@@ -1,4 +1,5 @@
 import { fetch } from 'undici';
+import { readRuntimeResponseText } from '../../proxy-core/executors/types.js';
 import { withSiteProxyRequestInit } from '../../services/siteProxy.js';
 import { summarizeUpstreamError } from './upstreamError.js';
 import type { UpstreamEndpoint } from './upstreamEndpoint.js';
@@ -93,7 +94,6 @@ async function runEndpointFlowHook<T>(
     console.error(`endpointFlow ${hookName} hook failed`, error);
   }
 }
-
 export async function executeEndpointFlow(input: ExecuteEndpointFlowInput): Promise<EndpointFlowResult> {
   const endpointCount = input.endpointCandidates.length;
   if (endpointCount <= 0) {
@@ -139,7 +139,7 @@ export async function executeEndpointFlow(input: ExecuteEndpointFlowInput): Prom
       };
     }
 
-    let rawErrText = await response.text().catch(() => 'unknown error');
+    let rawErrText = await readRuntimeResponseText(response).catch(() => 'unknown error');
     const baseContext: EndpointAttemptContext = {
       endpointIndex,
       endpointCount,

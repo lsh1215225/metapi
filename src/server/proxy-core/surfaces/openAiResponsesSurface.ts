@@ -7,7 +7,7 @@ import { isTokenExpiredError } from '../../services/alertRules.js';
 import { shouldRetryProxyRequest } from '../../services/proxyRetryPolicy.js';
 import { resolveProxyUsageWithSelfLogFallback } from '../../services/proxyUsageFallbackService.js';
 import { mergeProxyUsage, parseProxyUsage } from '../../services/proxyUsageParser.js';
-import { resolveProxyUrlForSite, withSiteRecordProxyRequestInit } from '../../services/siteProxy.js';
+import { resolveChannelProxyUrl, withSiteRecordProxyRequestInit } from '../../services/siteProxy.js';
 import { openAiResponsesTransformer } from '../../transformers/openai/responses/index.js';
 import {
   buildUpstreamEndpointRequest,
@@ -19,6 +19,7 @@ import { ensureModelAllowedForDownstreamKey, getDownstreamRoutingPolicy, recordD
 import { composeProxyLogMessage } from '../../routes/proxy/logPathMeta.js';
 import { executeEndpointFlow, type BuiltEndpointRequest } from '../../routes/proxy/endpointFlow.js';
 import { detectProxyFailure } from '../../routes/proxy/proxyFailureJudge.js';
+import { buildUpstreamUrl } from '../../routes/proxy/upstreamUrl.js';
 import { formatUtcSqlDateTime } from '../../services/localTimeService.js';
 import { resolveProxyLogBilling } from '../../routes/proxy/proxyBilling.js';
 import { getProxyAuthContext, getProxyResourceOwner } from '../../middleware/auth.js';
@@ -134,14 +135,20 @@ function carriesResponsesFileUrlInput(value: unknown): boolean {
   return Object.values(value).some((entry) => carriesResponsesFileUrlInput(entry));
 }
 
-type UsageSummary = ReturnType<typeof parseProxyUsage>;
-
-function deriveCodexExplicitSessionId(body: Record<string, unknown>): string | null {
-  const promptCacheKey = typeof body.prompt_cache_key === 'string'
-    ? body.prompt_cache_key.trim()
-    : '';
-  return promptCacheKey || null;
+function shouldRefreshOauthResponsesRequest(input: {
+  oauthProvider?: string;
+  status: number;
+  response: { headers: { get(name: string): string | null } };
+  rawErrText: string;
+}): boolean {
+  if (input.status === 401) return true;
+  if (input.status !== 403 || input.oauthProvider !== 'codex') return false;
+  const authenticate = input.response.headers.get('www-authenticate') || '';
+  const combined = `${authenticate}\n${input.rawErrText || ''}`;
+  return /\b(invalid_token|expired_token|expired|invalid|unauthorized|account mismatch|authentication)\b/i.test(combined);
 }
+
+type UsageSummary = ReturnType<typeof parseProxyUsage>;
 
 export async function handleOpenAiResponsesSurfaceRequest(
   request: FastifyRequest,
@@ -237,14 +244,6 @@ export async function handleOpenAiResponsesSurfaceRequest(
       const responsesConversationFileSummary = summarizeConversationFileInputsInResponsesBody(normalizedResponsesBody);
       const requiresNativeResponsesFileUrl = responsesConversationFileSummary.hasRemoteDocumentUrl
         || carriesResponsesFileUrlInput(normalizedResponsesBody.input);
-      if (requiresNativeResponsesFileUrl && String(selected.site.platform || '').trim().toLowerCase() === 'claude') {
-        return reply.code(400).send({
-          error: {
-            message: 'Responses input_file.file_url requires an upstream /v1/responses endpoint; current site only supports /v1/messages.',
-            type: 'invalid_request_error',
-          },
-        });
-      }
       const endpointCandidates = await resolveUpstreamEndpointCandidates(
         {
           site: selected.site,
@@ -259,9 +258,6 @@ export async function handleOpenAiResponsesSurfaceRequest(
           wantsNativeResponsesReasoning: prefersNativeResponsesReasoning,
         },
       );
-      if (requiresNativeResponsesFileUrl) {
-        endpointCandidates.splice(0, endpointCandidates.length, 'responses');
-      }
       if (endpointCandidates.length === 0) {
         endpointCandidates.push('responses', 'chat', 'messages');
       }
@@ -284,7 +280,6 @@ export async function handleOpenAiResponsesSurfaceRequest(
       );
       const buildEndpointRequest = (endpoint: 'chat' | 'messages' | 'responses') => {
         const upstreamStream = isStream || (isCodexSite && endpoint === 'responses');
-        const codexExplicitSessionId = deriveCodexExplicitSessionId(normalizedResponsesBody);
         const endpointRequest = buildUpstreamEndpointRequest({
           endpoint,
           modelName,
@@ -299,7 +294,6 @@ export async function handleOpenAiResponsesSurfaceRequest(
           responsesOriginalBody: normalizedResponsesBody,
           downstreamHeaders: request.headers as Record<string, unknown>,
           providerHeaders: buildProviderHeaders(),
-          codexExplicitSessionId,
         });
         const upstreamPath = (
           isCompactRequest && endpoint === 'responses'
@@ -314,6 +308,7 @@ export async function handleOpenAiResponsesSurfaceRequest(
           runtime: endpointRequest.runtime,
         };
       };
+      const channelProxyUrl = resolveChannelProxyUrl(selected.site, selected.account.extraConfig);
       const dispatchRequest = (compatibilityRequest: BuiltEndpointRequest, targetUrl?: string) => (
         dispatchRuntimeRequest({
           siteUrl: selected.site.url,
@@ -323,7 +318,7 @@ export async function handleOpenAiResponsesSurfaceRequest(
             method: 'POST',
             headers: requestForFetch.headers,
             body: JSON.stringify(requestForFetch.body),
-          }),
+          }, channelProxyUrl),
         })
       );
       const endpointStrategy = openAiResponsesTransformer.compatibility.createEndpointStrategy({
@@ -332,7 +327,12 @@ export async function handleOpenAiResponsesSurfaceRequest(
         dispatchRequest,
       });
       const tryRecover = async (ctx: Parameters<NonNullable<typeof endpointStrategy.tryRecover>>[0]) => {
-        if (ctx.response.status === 401 && oauth) {
+        if (oauth && shouldRefreshOauthResponsesRequest({
+          oauthProvider: oauth.provider,
+          status: ctx.response.status,
+          response: ctx.response,
+          rawErrText: ctx.rawErrText || '',
+        })) {
           try {
             const refreshed = await refreshOauthAccessTokenSingleflight(selected.account.id);
             selected.tokenValue = refreshed.accessToken;
@@ -342,7 +342,7 @@ export async function handleOpenAiResponsesSurfaceRequest(
               extraConfig: refreshed.extraConfig ?? selected.account.extraConfig,
             };
             const refreshedRequest = buildEndpointRequest(ctx.request.endpoint);
-            const refreshedTargetUrl = `${selected.site.url}${refreshedRequest.path}`;
+            const refreshedTargetUrl = buildUpstreamUrl(selected.site.url, refreshedRequest.path);
             const refreshedResponse = await dispatchRequest(refreshedRequest, refreshedTargetUrl);
             if (refreshedResponse.ok) {
               return {
@@ -367,7 +367,6 @@ export async function handleOpenAiResponsesSurfaceRequest(
       try {
         const endpointResult = await executeEndpointFlow({
           siteUrl: selected.site.url,
-          proxyUrl: resolveProxyUrlForSite(selected.site),
           endpointCandidates,
           buildRequest: (endpoint) => buildEndpointRequest(endpoint),
           dispatchRequest,

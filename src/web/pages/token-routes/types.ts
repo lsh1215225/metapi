@@ -28,6 +28,9 @@ export type RouteChannel = {
   cooldownUntil?: string | null;
   account?: {
     username: string | null;
+    accessToken?: string | null;
+    extraConfig?: string | null;
+    credentialMode?: string | null;
   };
   site?: {
     id: number;
@@ -151,12 +154,15 @@ export type SortableChannelRowProps = {
   loadingDecision: boolean;
   isSavingPriority: boolean;
   readOnly?: boolean;
+  mobile?: boolean;
   tokenOptions: RouteTokenOption[];
   activeTokenId: number;
   isUpdatingToken: boolean;
   onTokenDraftChange: (channelId: number, tokenId: number) => void;
   onSaveToken: () => void;
   onDeleteChannel: () => void;
+  onToggleEnabled: (enabled: boolean) => void;
+  onSiteBlockModel?: () => void;
 };
 
 export type GroupRouteItem = {

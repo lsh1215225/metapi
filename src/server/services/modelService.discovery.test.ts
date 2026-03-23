@@ -7,6 +7,19 @@ import { eq } from 'drizzle-orm';
 const getApiTokenMock = vi.fn();
 const getModelsMock = vi.fn();
 const undiciFetchMock = vi.fn();
+const proxyAgentCtorMock = vi.fn();
+const refreshOauthAccessTokenSingleflightMock = vi.fn();
+
+class MockProxyAgent {
+  readonly proxyUrl: string;
+
+  constructor(proxyUrl: string) {
+    this.proxyUrl = proxyUrl;
+    proxyAgentCtorMock(proxyUrl);
+  }
+}
+
+class MockAgent {}
 
 vi.mock('./platforms/index.js', () => ({
   getAdapter: () => ({
@@ -17,6 +30,12 @@ vi.mock('./platforms/index.js', () => ({
 
 vi.mock('undici', () => ({
   fetch: (...args: unknown[]) => undiciFetchMock(...args),
+  ProxyAgent: MockProxyAgent,
+  Agent: MockAgent,
+}));
+
+vi.mock('./oauth/refreshSingleflight.js', () => ({
+  refreshOauthAccessTokenSingleflight: (...args: unknown[]) => refreshOauthAccessTokenSingleflightMock(...args),
 }));
 
 type DbModule = typeof import('../db/index.js');
@@ -47,6 +66,8 @@ describe('refreshModelsForAccount credential discovery', () => {
     getApiTokenMock.mockReset();
     getModelsMock.mockReset();
     undiciFetchMock.mockReset();
+    proxyAgentCtorMock.mockReset();
+    refreshOauthAccessTokenSingleflightMock.mockReset();
 
     await db.delete(schema.routeChannels).run();
     await db.delete(schema.tokenRoutes).run();
@@ -248,6 +269,55 @@ describe('refreshModelsForAccount credential discovery', () => {
     expect(parsed.runtimeHealth?.checkedAt).toMatch(/\d{4}-\d{2}-\d{2}T/);
   });
 
+  it('does not scan hidden managed tokens for direct apikey connections', async () => {
+    getApiTokenMock.mockResolvedValue(null);
+    getModelsMock.mockImplementation(async (_baseUrl: string, token: string) => (
+      token === 'sk-direct-credential' ? ['gpt-4.1'] : ['legacy-should-not-be-used']
+    ));
+
+    const site = await db.insert(schema.sites).values({
+      name: 'apikey-direct-site',
+      url: 'https://apikey-direct.example.com',
+      platform: 'new-api',
+      status: 'active',
+    }).returning().get();
+
+    const account = await db.insert(schema.accounts).values({
+      siteId: site.id,
+      username: 'apikey-direct-user',
+      accessToken: '',
+      apiToken: 'sk-direct-credential',
+      status: 'active',
+      extraConfig: JSON.stringify({ credentialMode: 'apikey' }),
+    }).returning().get();
+
+    const hiddenToken = await db.insert(schema.accountTokens).values({
+      accountId: account.id,
+      name: 'legacy-hidden',
+      token: 'sk-legacy-hidden',
+      source: 'legacy',
+      enabled: true,
+      isDefault: true,
+    }).returning().get();
+
+    const result = await refreshModelsForAccount(account.id);
+
+    expect(result).toMatchObject({
+      accountId: account.id,
+      refreshed: true,
+      status: 'success',
+      modelCount: 1,
+      modelsPreview: ['gpt-4.1'],
+      tokenScanned: 0,
+      discoveredByCredential: true,
+    });
+
+    const tokenRows = await db.select().from(schema.tokenModelAvailability)
+      .where(eq(schema.tokenModelAvailability.tokenId, hiddenToken.id))
+      .all();
+    expect(tokenRows).toHaveLength(0);
+  });
+
   it('returns structured result when account missing', async () => {
     const result = await refreshModelsForAccount(9999);
 
@@ -320,6 +390,83 @@ describe('refreshModelsForAccount credential discovery', () => {
       modelCount: 0,
       modelsPreview: [],
       reason: 'adapter_or_status',
+    });
+  });
+
+  it('preserves existing availability when allowInactive refresh fails', async () => {
+    getApiTokenMock.mockResolvedValue(null);
+    getModelsMock.mockRejectedValue(new Error('upstream unavailable'));
+
+    const site = await db.insert(schema.sites).values({
+      name: 'site-rebind-refresh',
+      url: 'https://site-rebind-refresh.example.com',
+      platform: 'new-api',
+      status: 'active',
+    }).returning().get();
+
+    const account = await db.insert(schema.accounts).values({
+      siteId: site.id,
+      username: 'rebind-user',
+      accessToken: 'session-token',
+      apiToken: null,
+      status: 'disabled',
+      extraConfig: JSON.stringify({ credentialMode: 'session' }),
+    }).returning().get();
+
+    const token = await db.insert(schema.accountTokens).values({
+      accountId: account.id,
+      name: 'default',
+      token: 'sk-stored-token',
+      source: 'manual',
+      enabled: true,
+      isDefault: true,
+      valueStatus: 'ready' as any,
+    }).returning().get();
+
+    await db.insert(schema.modelAvailability).values({
+      accountId: account.id,
+      modelName: 'gpt-4.1',
+      available: true,
+      latencyMs: 120,
+      checkedAt: '2026-03-21T11:30:00.000Z',
+    }).run();
+
+    await db.insert(schema.tokenModelAvailability).values({
+      tokenId: token.id,
+      modelName: 'gpt-4.1',
+      available: true,
+      latencyMs: 90,
+      checkedAt: '2026-03-21T11:30:00.000Z',
+    }).run();
+
+    const result = await refreshModelsForAccount(account.id, { allowInactive: true });
+
+    expect(result).toMatchObject({
+      accountId: account.id,
+      refreshed: true,
+      status: 'failed',
+      modelCount: 0,
+      discoveredByCredential: false,
+    });
+
+    const modelRows = await db.select().from(schema.modelAvailability)
+      .where(eq(schema.modelAvailability.accountId, account.id))
+      .all();
+    expect(modelRows).toHaveLength(1);
+    expect(modelRows[0]).toMatchObject({
+      accountId: account.id,
+      modelName: 'gpt-4.1',
+      available: true,
+    });
+
+    const tokenRows = await db.select().from(schema.tokenModelAvailability)
+      .where(eq(schema.tokenModelAvailability.tokenId, token.id))
+      .all();
+    expect(tokenRows).toHaveLength(1);
+    expect(tokenRows[0]).toMatchObject({
+      tokenId: token.id,
+      modelName: 'gpt-4.1',
+      available: true,
     });
   });
 
@@ -473,6 +620,78 @@ describe('refreshModelsForAccount credential discovery', () => {
     ]);
   });
 
+  it('discovers Claude OAuth models from the upstream /v1/models response', async () => {
+    getApiTokenMock.mockResolvedValue(null);
+    getModelsMock.mockRejectedValue(new Error('claude oauth discovery should not call adapter.getModels'));
+    undiciFetchMock.mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        data: [
+          { id: 'claude-3-7-sonnet-latest' },
+          { id: 'claude-opus-4-1-20250805' },
+        ],
+      }),
+      text: async () => JSON.stringify({ ok: true }),
+    });
+
+    const site = await db.insert(schema.sites).values({
+      name: 'claude-site',
+      url: 'https://api.anthropic.com',
+      platform: 'claude',
+      status: 'active',
+    }).returning().get();
+
+    const account = await db.insert(schema.accounts).values({
+      siteId: site.id,
+      username: 'claude-user@example.com',
+      accessToken: 'claude-oauth-token',
+      apiToken: null,
+      status: 'active',
+      extraConfig: JSON.stringify({
+        credentialMode: 'session',
+        oauth: {
+          provider: 'claude',
+          email: 'claude-user@example.com',
+          accountKey: 'claude-user@example.com',
+        },
+      }),
+    }).returning().get();
+
+    const result = await refreshModelsForAccount(account.id);
+
+    expect(result).toMatchObject({
+      accountId: account.id,
+      refreshed: true,
+      status: 'success',
+      errorCode: null,
+      tokenScanned: 0,
+      discoveredByCredential: true,
+      discoveredApiToken: false,
+      modelCount: 2,
+      modelsPreview: ['claude-3-7-sonnet-latest', 'claude-opus-4-1-20250805'],
+    });
+    expect(getModelsMock).not.toHaveBeenCalled();
+    expect(undiciFetchMock).toHaveBeenCalledTimes(1);
+    expect(String(undiciFetchMock.mock.calls[0]?.[0] || '')).toBe('https://api.anthropic.com/v1/models');
+    expect(undiciFetchMock.mock.calls[0]?.[1]).toMatchObject({
+      method: 'GET',
+      headers: expect.objectContaining({
+        Authorization: 'Bearer claude-oauth-token',
+        Accept: 'application/json',
+        'anthropic-version': '2023-06-01',
+      }),
+    });
+
+    const rows = await db.select().from(schema.modelAvailability)
+      .where(eq(schema.modelAvailability.accountId, account.id))
+      .all();
+    expect(rows.map((row) => row.modelName).sort()).toEqual([
+      'claude-3-7-sonnet-latest',
+      'claude-opus-4-1-20250805',
+    ]);
+  });
+
   it('marks codex oauth account abnormal when upstream cloud discovery fails', async () => {
     getApiTokenMock.mockResolvedValue(null);
     getModelsMock.mockRejectedValue(new Error('codex plan discovery should not call adapter.getModels'));
@@ -544,6 +763,239 @@ describe('refreshModelsForAccount credential discovery', () => {
     expect(parsed.oauth.lastModelSyncError).toContain('HTTP 403');
     expect(parsed.oauth.lastModelSyncAt).toMatch(/\d{4}-\d{2}-\d{2}T/);
     expect(parsed.runtimeHealth?.state).toBe('unhealthy');
+  });
+
+  it('applies account proxy override to codex oauth cloud discovery requests', async () => {
+    getApiTokenMock.mockResolvedValue(null);
+    getModelsMock.mockRejectedValue(new Error('codex oauth discovery should not call adapter.getModels'));
+    undiciFetchMock.mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        models: [
+          { id: 'gpt-5.4' },
+        ],
+      }),
+      text: async () => JSON.stringify({ ok: true }),
+    });
+
+    const site = await db.insert(schema.sites).values({
+      name: 'codex-account-proxy-site',
+      url: 'https://chatgpt.com/backend-api/codex',
+      platform: 'codex',
+      status: 'active',
+    }).returning().get();
+
+    const account = await db.insert(schema.accounts).values({
+      siteId: site.id,
+      username: 'codex-proxy-user@example.com',
+      accessToken: 'oauth-access-token',
+      apiToken: null,
+      status: 'active',
+      extraConfig: JSON.stringify({
+        credentialMode: 'session',
+        proxyUrl: 'http://127.0.0.1:7890',
+        oauth: {
+          provider: 'codex',
+          accountId: 'chatgpt-account-proxy',
+          email: 'codex-proxy-user@example.com',
+          planType: 'plus',
+        },
+      }),
+    }).returning().get();
+
+    const result = await refreshModelsForAccount(account.id);
+
+    expect(result).toMatchObject({
+      accountId: account.id,
+      refreshed: true,
+      status: 'success',
+      modelCount: 1,
+      modelsPreview: ['gpt-5.4'],
+    });
+    expect(undiciFetchMock).toHaveBeenCalledTimes(1);
+    expect(proxyAgentCtorMock).toHaveBeenCalledWith('http://127.0.0.1:7890');
+    expect(undiciFetchMock.mock.calls[0]?.[1]).toMatchObject({
+      method: 'GET',
+      dispatcher: expect.any(MockProxyAgent),
+    });
+  });
+
+  it('applies account proxy override to gemini oauth validation requests', async () => {
+    getApiTokenMock.mockResolvedValue(null);
+    getModelsMock.mockRejectedValue(new Error('gemini oauth validation should not call adapter.getModels'));
+    undiciFetchMock.mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        state: 'ENABLED',
+      }),
+      text: async () => JSON.stringify({ state: 'ENABLED' }),
+    });
+
+    const site = await db.insert(schema.sites).values({
+      name: 'gemini-account-proxy-site',
+      url: 'https://gemini.example.com',
+      platform: 'gemini',
+      status: 'active',
+    }).returning().get();
+
+    const account = await db.insert(schema.accounts).values({
+      siteId: site.id,
+      username: 'gemini-proxy-user@example.com',
+      accessToken: 'gemini-access-token',
+      apiToken: null,
+      status: 'active',
+      extraConfig: JSON.stringify({
+        credentialMode: 'session',
+        proxyUrl: 'http://127.0.0.1:1080',
+        oauth: {
+          provider: 'gemini-cli',
+          projectId: 'project-proxy-demo',
+          email: 'gemini-proxy-user@example.com',
+        },
+      }),
+    }).returning().get();
+
+    const result = await refreshModelsForAccount(account.id);
+
+    expect(result).toMatchObject({
+      accountId: account.id,
+      refreshed: true,
+      status: 'success',
+      modelCount: expect.any(Number),
+    });
+    expect(undiciFetchMock).toHaveBeenCalledTimes(1);
+    expect(proxyAgentCtorMock).toHaveBeenCalledWith('http://127.0.0.1:1080');
+    expect(String(undiciFetchMock.mock.calls[0]?.[0] || '')).toContain('/projects/project-proxy-demo/services/');
+    expect(undiciFetchMock.mock.calls[0]?.[1]).toMatchObject({
+      method: 'GET',
+      dispatcher: expect.any(MockProxyAgent),
+    });
+  });
+
+  it('refreshes gemini oauth access token during validation through singleflight and reuses the refreshed account state', async () => {
+    getApiTokenMock.mockResolvedValue(null);
+    getModelsMock.mockRejectedValue(new Error('gemini oauth validation should not call adapter.getModels'));
+    refreshOauthAccessTokenSingleflightMock.mockImplementation(async (accountId: number) => {
+      const refreshedExtraConfig = JSON.stringify({
+        credentialMode: 'session',
+        oauth: {
+          provider: 'gemini-cli',
+          email: 'gemini-refreshed-user@example.com',
+          accountId: 'gemini-refreshed-user@example.com',
+          accountKey: 'gemini-refreshed-user@example.com',
+          projectId: 'project-refresh-demo',
+          refreshToken: 'gemini-refresh-token-next',
+        },
+      });
+
+      await db.update(schema.accounts).set({
+        accessToken: 'gemini-access-token-refreshed',
+        oauthProvider: 'gemini-cli',
+        oauthAccountKey: 'gemini-refreshed-user@example.com',
+        oauthProjectId: 'project-refresh-demo',
+        extraConfig: refreshedExtraConfig,
+        status: 'active',
+        updatedAt: '2026-03-21T00:00:00.000Z',
+      }).where(eq(schema.accounts.id, accountId)).run();
+
+      return {
+        accountId,
+        accessToken: 'gemini-access-token-refreshed',
+        accountKey: 'gemini-refreshed-user@example.com',
+        extraConfig: refreshedExtraConfig,
+      };
+    });
+    undiciFetchMock
+      .mockResolvedValueOnce({
+        ok: false,
+        status: 401,
+        json: async () => ({ error: 'expired' }),
+        text: async () => 'expired',
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({ state: 'ENABLED' }),
+        text: async () => JSON.stringify({ state: 'ENABLED' }),
+      });
+
+    const site = await db.insert(schema.sites).values({
+      name: 'gemini-refresh-site',
+      url: 'https://gemini.example.com',
+      platform: 'gemini',
+      status: 'active',
+    }).returning().get();
+
+    const account = await db.insert(schema.accounts).values({
+      siteId: site.id,
+      username: 'gemini-user@example.com',
+      accessToken: 'gemini-access-token-expired',
+      apiToken: null,
+      status: 'active',
+      oauthProvider: 'gemini-cli',
+      oauthAccountKey: 'gemini-user@example.com',
+      oauthProjectId: 'project-refresh-demo',
+      extraConfig: JSON.stringify({
+        credentialMode: 'session',
+        oauth: {
+          provider: 'gemini-cli',
+          email: 'gemini-user@example.com',
+          accountId: 'gemini-user@example.com',
+          accountKey: 'gemini-user@example.com',
+          projectId: 'project-refresh-demo',
+          refreshToken: 'gemini-refresh-token',
+        },
+      }),
+    }).returning().get();
+
+    const result = await refreshModelsForAccount(account.id);
+
+    expect(result).toMatchObject({
+      accountId: account.id,
+      refreshed: true,
+      status: 'success',
+      modelCount: expect.any(Number),
+      discoveredByCredential: true,
+    });
+    expect(refreshOauthAccessTokenSingleflightMock).toHaveBeenCalledWith(account.id);
+    expect(undiciFetchMock).toHaveBeenCalledTimes(2);
+    expect(String(undiciFetchMock.mock.calls[0]?.[0] || '')).toContain('/projects/project-refresh-demo/services/');
+    expect(undiciFetchMock.mock.calls[0]?.[1]).toMatchObject({
+      method: 'GET',
+      headers: expect.objectContaining({
+        Authorization: 'Bearer gemini-access-token-expired',
+      }),
+    });
+    expect(
+      undiciFetchMock.mock.calls.some(([url]) => String(url || '').includes('oauth2.googleapis.com/token')),
+    ).toBe(false);
+    expect(String(undiciFetchMock.mock.calls[1]?.[0] || '')).toContain('/projects/project-refresh-demo/services/');
+    expect(undiciFetchMock.mock.calls[1]?.[1]).toMatchObject({
+      method: 'GET',
+      headers: expect.objectContaining({
+        Authorization: 'Bearer gemini-access-token-refreshed',
+      }),
+    });
+
+    const latest = await db.select().from(schema.accounts)
+      .where(eq(schema.accounts.id, account.id))
+      .get();
+    expect(latest).toMatchObject({
+      accessToken: 'gemini-access-token-refreshed',
+      oauthProvider: 'gemini-cli',
+      oauthAccountKey: 'gemini-refreshed-user@example.com',
+      oauthProjectId: 'project-refresh-demo',
+    });
+    const parsed = JSON.parse(latest!.extraConfig || '{}');
+    expect(parsed.oauth).toMatchObject({
+      provider: 'gemini-cli',
+      email: 'gemini-refreshed-user@example.com',
+      refreshToken: 'gemini-refresh-token-next',
+      projectId: 'project-refresh-demo',
+      modelDiscoveryStatus: 'healthy',
+    });
   });
 
   it('discovers antigravity oauth models via fetchAvailableModels fallback using the oauth project id', async () => {

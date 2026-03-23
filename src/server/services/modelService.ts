@@ -11,17 +11,22 @@ import {
 } from './accountTokenService.js';
 import {
   getCredentialModeFromExtraConfig,
+  getProxyUrlFromExtraConfig,
   mergeAccountExtraConfig,
+  requiresManagedAccountTokens,
   resolvePlatformUserId,
   supportsDirectAccountRoutingConnection,
 } from './accountExtraConfig.js';
 import { invalidateTokenRouterCache } from './tokenRouter.js';
+import { getBlockedBrandRules, isModelBlockedByBrand } from './brandMatcher.js';
+import { config } from '../config.js';
 import { setAccountRuntimeHealth } from './accountHealthService.js';
 import { clearAllRouteDecisionSnapshots } from './routeDecisionSnapshotStore.js';
-import { withSiteRecordProxyRequestInit } from './siteProxy.js';
+import { withAccountProxyOverride, withExplicitProxyRequestInit, withSiteRecordProxyRequestInit } from './siteProxy.js';
 import { getCodexOauthInfoFromExtraConfig, isCodexPlatform } from './oauth/codexAccount.js';
 import { buildOauthInfo, getOauthInfoFromExtraConfig } from './oauth/oauthAccount.js';
 import { CLAUDE_DEFAULT_ANTHROPIC_VERSION } from './oauth/claudeProvider.js';
+import { refreshOauthAccessTokenSingleflight } from './oauth/refreshSingleflight.js';
 import {
   ANTIGRAVITY_DAILY_UPSTREAM_BASE_URL,
   ANTIGRAVITY_MODELS_USER_AGENT,
@@ -38,18 +43,6 @@ const API_TOKEN_DISCOVERY_TIMEOUT_MS = 8_000;
 const MODEL_DISCOVERY_TIMEOUT_MS = 12_000;
 const MODEL_REFRESH_BATCH_SIZE = 3;
 const CODEX_MODELS_CLIENT_VERSION = '1.0.0';
-const CLAUDE_STATIC_MODELS = [
-  'claude-haiku-4-5-20251001',
-  'claude-sonnet-4-5-20250929',
-  'claude-sonnet-4-6',
-  'claude-opus-4-6',
-  'claude-opus-4-5-20251101',
-  'claude-opus-4-1-20250805',
-  'claude-opus-4-20250514',
-  'claude-sonnet-4-20250514',
-  'claude-3-7-sonnet-20250219',
-  'claude-3-5-haiku-20241022',
-];
 const GEMINI_CLI_STATIC_MODELS = [
   'gemini-2.5-pro',
   'gemini-2.5-flash',
@@ -141,12 +134,6 @@ function isSiteDisabled(status?: string | null): boolean {
   return (status || 'active') === 'disabled';
 }
 
-function isApiKeyConnection(account: typeof schema.accounts.$inferSelect): boolean {
-  const explicit = getCredentialModeFromExtraConfig(account.extraConfig);
-  if (explicit && explicit !== 'auto') return explicit === 'apikey';
-  return !(account.accessToken || '').trim();
-}
-
 function normalizeModels(models: string[]): string[] {
   const normalizedModels: string[] = [];
   const seen = new Set<string>();
@@ -190,6 +177,21 @@ function extractCodexModelIds(payload: unknown): string[] {
     const id = typeof record.id === 'string'
       ? record.id
       : (typeof record.slug === 'string' ? record.slug : (typeof record.model === 'string' ? record.model : ''));
+    return id ? [id] : [];
+  });
+}
+
+function extractClaudeModelIds(payload: unknown): string[] {
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return [];
+  const record = payload as { data?: unknown };
+  if (!Array.isArray(record.data)) return [];
+
+  return record.data.flatMap((item) => {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) return [];
+    const value = item as { id?: unknown; name?: unknown };
+    const id = typeof value.id === 'string'
+      ? value.id.trim()
+      : (typeof value.name === 'string' ? value.name.trim() : '');
     return id ? [id] : [];
   });
 }
@@ -288,10 +290,10 @@ async function discoverCodexModelsFromCloud(input: {
   return normalizeModels(extractCodexModelIds(await response.json()));
 }
 
-async function validateClaudeOauthConnection(input: {
+async function discoverClaudeModelsFromCloud(input: {
   site: typeof schema.sites.$inferSelect;
   account: typeof schema.accounts.$inferSelect;
-}): Promise<void> {
+}): Promise<string[]> {
   const accessToken = (input.account.accessToken || '').trim();
   if (!accessToken) {
     throw new Error('claude oauth access token missing');
@@ -309,8 +311,9 @@ async function validateClaudeOauthConnection(input: {
   );
   if (!response.ok) {
     const text = await response.text().catch(() => '');
-    throw new Error(`HTTP ${response.status}: ${text || 'claude oauth validation failed'}`);
+    throw new Error(`HTTP ${response.status}: ${text || 'claude oauth model discovery failed'}`);
   }
+  return normalizeModels(extractClaudeModelIds(await response.json()));
 }
 
 async function validateGeminiCliOauthConnection(input: {
@@ -327,7 +330,7 @@ async function validateGeminiCliOauthConnection(input: {
   }
   const response = await fetch(
     `https://serviceusage.googleapis.com/v1/projects/${encodeURIComponent(projectId)}/services/${encodeURIComponent(GEMINI_CLI_REQUIRED_SERVICE)}`,
-    {
+    withExplicitProxyRequestInit(getProxyUrlFromExtraConfig(input.account.extraConfig), {
       method: 'GET',
       headers: {
         Authorization: `Bearer ${accessToken}`,
@@ -335,7 +338,7 @@ async function validateGeminiCliOauthConnection(input: {
         'User-Agent': GEMINI_CLI_USER_AGENT,
         'X-Goog-Api-Client': GEMINI_CLI_GOOGLE_API_CLIENT,
       },
-    },
+    }, true),
   );
   if (!response.ok) {
     const text = await response.text().catch(() => '');
@@ -485,7 +488,17 @@ function buildSuccessfulRefreshResult(input: {
   };
 }
 
-export async function refreshModelsForAccount(accountId: number): Promise<ModelRefreshResult> {
+function shouldRetryModelDiscoveryWithOauthRefresh(error: unknown): boolean {
+  const message = ((error as { message?: string })?.message || '').toLowerCase();
+  return message.includes('http 401')
+    || message.includes('unauthorized')
+    || message.includes('unauthenticated');
+}
+
+export async function refreshModelsForAccount(
+  accountId: number,
+  options?: { allowInactive?: boolean },
+): Promise<ModelRefreshResult> {
   const row = await db.select().from(schema.accounts)
     .innerJoin(schema.sites, eq(schema.accounts.siteId, schema.sites.id))
     .where(eq(schema.accounts.id, accountId))
@@ -499,27 +512,67 @@ export async function refreshModelsForAccount(accountId: number): Promise<ModelR
   const site = row.sites;
   const oauth = getOauthInfoFromExtraConfig(account.extraConfig);
   const adapter = getAdapter(site.platform);
+  const accountProxyUrl = getProxyUrlFromExtraConfig(account.extraConfig);
 
-  const accountTokens = await db.select()
-    .from(schema.accountTokens)
-    .where(eq(schema.accountTokens.accountId, accountId))
-    .all();
-
-  await db.delete(schema.modelAvailability)
-    .where(eq(schema.modelAvailability.accountId, accountId))
-    .run();
-
-  for (const token of accountTokens) {
-    await db.delete(schema.tokenModelAvailability)
+  const restoreAvailabilityOnFailure = options?.allowInactive === true;
+  const previousAccountTokens = restoreAvailabilityOnFailure
+    ? await db.select()
+      .from(schema.accountTokens)
+      .where(eq(schema.accountTokens.accountId, accountId))
+      .all()
+    : [];
+  const previousModelAvailability = restoreAvailabilityOnFailure
+    ? await db.select()
+      .from(schema.modelAvailability)
+      .where(eq(schema.modelAvailability.accountId, accountId))
+      .all()
+    : [];
+  const previousTokenModelAvailability = restoreAvailabilityOnFailure
+    ? (await Promise.all(previousAccountTokens.map(async (token) => db.select()
+      .from(schema.tokenModelAvailability)
       .where(eq(schema.tokenModelAvailability.tokenId, token.id))
+      .all()))).flat()
+    : [];
+
+  const clearExistingAvailability = async () => {
+    await db.delete(schema.modelAvailability)
+      .where(eq(schema.modelAvailability.accountId, accountId))
       .run();
-  }
+
+    const currentAccountTokens = await db.select({ id: schema.accountTokens.id })
+      .from(schema.accountTokens)
+      .where(eq(schema.accountTokens.accountId, accountId))
+      .all();
+
+    for (const token of currentAccountTokens) {
+      await db.delete(schema.tokenModelAvailability)
+        .where(eq(schema.tokenModelAvailability.tokenId, token.id))
+        .run();
+    }
+  };
+
+  const restorePreviousAvailability = async () => {
+    if (!restoreAvailabilityOnFailure) return;
+    await clearExistingAvailability();
+    if (previousModelAvailability.length > 0) {
+      await db.insert(schema.modelAvailability).values(
+        previousModelAvailability.map(({ id: _id, ...row }) => row),
+      ).run();
+    }
+    if (previousTokenModelAvailability.length > 0) {
+      await db.insert(schema.tokenModelAvailability).values(
+        previousTokenModelAvailability.map(({ id: _id, ...row }) => row),
+      ).run();
+    }
+  };
+
+  await clearExistingAvailability();
 
   if (isSiteDisabled(site.status)) {
     return buildSkippedRefreshResult(accountId, 'site_disabled', '站点已禁用');
   }
 
-  if (account.status !== 'active') {
+  if (account.status !== 'active' && !options?.allowInactive) {
     return buildSkippedRefreshResult(accountId, 'adapter_or_status', '平台不可用或账号未激活');
   }
 
@@ -528,7 +581,8 @@ export async function refreshModelsForAccount(accountId: number): Promise<ModelR
     const startedAt = Date.now();
     try {
       const codexModels = await withTimeout(
-        () => discoverCodexModelsFromCloud({ site, account }),
+        () => withAccountProxyOverride(accountProxyUrl,
+          () => discoverCodexModelsFromCloud({ site, account })),
         MODEL_DISCOVERY_TIMEOUT_MS,
         `codex model discovery timeout (${Math.round(MODEL_DISCOVERY_TIMEOUT_MS / 1000)}s)`,
       );
@@ -582,6 +636,7 @@ export async function refreshModelsForAccount(accountId: number): Promise<ModelR
         source: 'model-discovery',
         checkedAt,
       });
+      await restorePreviousAvailability();
       return buildFailedRefreshResult({
         accountId,
         errorCode,
@@ -597,13 +652,17 @@ export async function refreshModelsForAccount(accountId: number): Promise<ModelR
     const checkedAt = new Date().toISOString();
     const startedAt = Date.now();
     try {
-      await withTimeout(
-        () => validateClaudeOauthConnection({ site, account }),
+      const claudeModels = await withTimeout(
+        () => withAccountProxyOverride(accountProxyUrl,
+          () => discoverClaudeModelsFromCloud({ site, account })),
         MODEL_DISCOVERY_TIMEOUT_MS,
-        `claude oauth validation timeout (${Math.round(MODEL_DISCOVERY_TIMEOUT_MS / 1000)}s)`,
+        `claude oauth model discovery timeout (${Math.round(MODEL_DISCOVERY_TIMEOUT_MS / 1000)}s)`,
       );
+      if (claudeModels.length === 0) {
+        throw new Error('未获取到可用模型');
+      }
       await db.insert(schema.modelAvailability).values(
-        CLAUDE_STATIC_MODELS.map((modelName) => ({
+        claudeModels.map((modelName) => ({
           accountId,
           modelName,
           available: true,
@@ -615,26 +674,26 @@ export async function refreshModelsForAccount(accountId: number): Promise<ModelR
         account,
         checkedAt,
         status: 'healthy',
-        lastDiscoveredModels: CLAUDE_STATIC_MODELS,
+        lastDiscoveredModels: claudeModels,
       });
       await setAccountRuntimeHealth(accountId, {
         state: 'healthy',
-        reason: 'Claude OAuth 健康探测成功',
+        reason: 'Claude OAuth 模型探测成功',
         source: 'model-discovery',
         checkedAt,
       });
       return buildSuccessfulRefreshResult({
         accountId,
-        modelCount: CLAUDE_STATIC_MODELS.length,
-        modelsPreview: CLAUDE_STATIC_MODELS.slice(0, 10),
+        modelCount: claudeModels.length,
+        modelsPreview: claudeModels.slice(0, 10),
         tokenScanned: 0,
         discoveredByCredential: true,
         discoveredApiToken: false,
       });
     } catch (err) {
-      const rawMessage = (err as { message?: string })?.message || 'claude oauth validation failed';
+      const rawMessage = (err as { message?: string })?.message || 'claude oauth model discovery failed';
       const errorCode = classifyModelDiscoveryError(rawMessage);
-      const errorMessage = `Claude 模型获取失败（${rawMessage}）`;
+      const errorMessage = `Claude OAuth 模型获取失败（${rawMessage}）`;
       await updateOauthModelDiscoveryState({
         account,
         checkedAt,
@@ -648,6 +707,7 @@ export async function refreshModelsForAccount(accountId: number): Promise<ModelR
         source: 'model-discovery',
         checkedAt,
       });
+      await restorePreviousAvailability();
       return buildFailedRefreshResult({
         accountId,
         errorCode,
@@ -662,12 +722,35 @@ export async function refreshModelsForAccount(accountId: number): Promise<ModelR
   if (oauth?.provider === 'gemini-cli') {
     const checkedAt = new Date().toISOString();
     const startedAt = Date.now();
+    let discoveryAccount = account;
     try {
-      await withTimeout(
-        () => validateGeminiCliOauthConnection({ account }),
-        MODEL_DISCOVERY_TIMEOUT_MS,
-        `gemini cli oauth validation timeout (${Math.round(MODEL_DISCOVERY_TIMEOUT_MS / 1000)}s)`,
-      );
+      try {
+        await withTimeout(
+          () => withAccountProxyOverride(accountProxyUrl,
+            () => validateGeminiCliOauthConnection({ account: discoveryAccount })),
+          MODEL_DISCOVERY_TIMEOUT_MS,
+          `gemini cli oauth validation timeout (${Math.round(MODEL_DISCOVERY_TIMEOUT_MS / 1000)}s)`,
+        );
+      } catch (error) {
+        if (!shouldRetryModelDiscoveryWithOauthRefresh(error)) {
+          throw error;
+        }
+        const refreshed = await refreshOauthAccessTokenSingleflight(discoveryAccount.id);
+        if (!refreshed?.extraConfig) {
+          throw error;
+        }
+        discoveryAccount = {
+          ...discoveryAccount,
+          accessToken: refreshed.accessToken,
+          extraConfig: refreshed.extraConfig,
+        };
+        await withTimeout(
+          () => withAccountProxyOverride(accountProxyUrl,
+            () => validateGeminiCliOauthConnection({ account: discoveryAccount })),
+          MODEL_DISCOVERY_TIMEOUT_MS,
+          `gemini cli oauth validation timeout (${Math.round(MODEL_DISCOVERY_TIMEOUT_MS / 1000)}s)`,
+        );
+      }
       await db.insert(schema.modelAvailability).values(
         GEMINI_CLI_STATIC_MODELS.map((modelName) => ({
           accountId,
@@ -678,7 +761,7 @@ export async function refreshModelsForAccount(accountId: number): Promise<ModelR
         })),
       ).run();
       await updateOauthModelDiscoveryState({
-        account,
+        account: discoveryAccount,
         checkedAt,
         status: 'healthy',
         lastDiscoveredModels: GEMINI_CLI_STATIC_MODELS,
@@ -702,7 +785,7 @@ export async function refreshModelsForAccount(accountId: number): Promise<ModelR
       const errorCode = classifyModelDiscoveryError(rawMessage);
       const errorMessage = `Gemini CLI 模型获取失败（${rawMessage}）`;
       await updateOauthModelDiscoveryState({
-        account,
+        account: discoveryAccount,
         checkedAt,
         status: 'abnormal',
         lastModelSyncError: errorMessage,
@@ -714,6 +797,7 @@ export async function refreshModelsForAccount(accountId: number): Promise<ModelR
         source: 'model-discovery',
         checkedAt,
       });
+      await restorePreviousAvailability();
       return buildFailedRefreshResult({
         accountId,
         errorCode,
@@ -730,7 +814,8 @@ export async function refreshModelsForAccount(accountId: number): Promise<ModelR
     const startedAt = Date.now();
     try {
       const antigravityModels = await withTimeout(
-        () => discoverAntigravityModelsFromCloud({ site, account }),
+        () => withAccountProxyOverride(accountProxyUrl,
+          () => discoverAntigravityModelsFromCloud({ site, account })),
         MODEL_DISCOVERY_TIMEOUT_MS,
         `antigravity model discovery timeout (${Math.round(MODEL_DISCOVERY_TIMEOUT_MS / 1000)}s)`,
       );
@@ -784,6 +869,7 @@ export async function refreshModelsForAccount(accountId: number): Promise<ModelR
         source: 'model-discovery',
         checkedAt,
       });
+      await restorePreviousAvailability();
       return buildFailedRefreshResult({
         accountId,
         errorCode,
@@ -805,7 +891,8 @@ export async function refreshModelsForAccount(accountId: number): Promise<ModelR
   if (!account.apiToken && account.accessToken) {
     try {
       discoveredApiToken = await withTimeout(
-        () => adapter.getApiToken(site.url, account.accessToken, platformUserId),
+        () => withAccountProxyOverride(accountProxyUrl,
+          () => adapter.getApiToken(site.url, account.accessToken, platformUserId)),
         API_TOKEN_DISCOVERY_TIMEOUT_MS,
         `api token discovery timeout (${Math.round(API_TOKEN_DISCOVERY_TIMEOUT_MS / 1000)}s)`,
       );
@@ -821,18 +908,21 @@ export async function refreshModelsForAccount(accountId: number): Promise<ModelR
     } catch { }
   }
 
-  let enabledTokens = await db.select()
-    .from(schema.accountTokens)
-    .where(and(
-      eq(schema.accountTokens.accountId, account.id),
-      eq(schema.accountTokens.enabled, true),
-      eq(schema.accountTokens.valueStatus, ACCOUNT_TOKEN_VALUE_STATUS_READY),
-    ))
-    .all();
+  const usesManagedTokens = requiresManagedAccountTokens(account);
+  let enabledTokens = usesManagedTokens
+    ? await db.select()
+      .from(schema.accountTokens)
+      .where(and(
+        eq(schema.accountTokens.accountId, account.id),
+        eq(schema.accountTokens.enabled, true),
+        eq(schema.accountTokens.valueStatus, ACCOUNT_TOKEN_VALUE_STATUS_READY),
+      ))
+      .all()
+    : [];
   enabledTokens = enabledTokens.filter(isUsableAccountToken);
 
   // Last fallback: if still no managed token but account has a legacy apiToken, mirror it into token table.
-  if (!isApiKeyConnection(account) && enabledTokens.length === 0) {
+  if (usesManagedTokens && enabledTokens.length === 0) {
     const fallback = discoveredApiToken || account.apiToken || null;
     if (fallback) {
       ensureDefaultTokenForAccount(account.id, fallback, { name: 'default', source: 'legacy' });
@@ -884,7 +974,8 @@ export async function refreshModelsForAccount(accountId: number): Promise<ModelR
     try {
       models = normalizeModels(
         await withTimeout(
-          () => adapter.getModels(site.url, credential, platformUserId),
+          () => withAccountProxyOverride(accountProxyUrl,
+            () => adapter.getModels(site.url, credential, platformUserId)),
           MODEL_DISCOVERY_TIMEOUT_MS,
           `model discovery timeout (${Math.round(MODEL_DISCOVERY_TIMEOUT_MS / 1000)}s)`,
         ),
@@ -911,7 +1002,8 @@ export async function refreshModelsForAccount(accountId: number): Promise<ModelR
     try {
       models = normalizeModels(
         await withTimeout(
-          () => adapter.getModels(site.url, token.token, platformUserId),
+          () => withAccountProxyOverride(accountProxyUrl,
+            () => adapter.getModels(site.url, token.token, platformUserId)),
           MODEL_DISCOVERY_TIMEOUT_MS,
           `model discovery timeout (${Math.round(MODEL_DISCOVERY_TIMEOUT_MS / 1000)}s)`,
         ),
@@ -950,6 +1042,7 @@ export async function refreshModelsForAccount(accountId: number): Promise<ModelR
       source: 'model-discovery',
       checkedAt: new Date().toISOString(),
     });
+    await restorePreviousAvailability();
     return buildFailedRefreshResult({
       accountId,
       errorCode,
@@ -1018,7 +1111,10 @@ export async function rebuildTokenRoutesFromAvailability() {
       ),
     )
     .all();
-  const usableTokenRows = tokenRows.filter((row) => isUsableAccountToken(row.account_tokens));
+  const usableTokenRows = tokenRows.filter((row) => (
+    isUsableAccountToken(row.account_tokens)
+    && requiresManagedAccountTokens(row.accounts)
+  ));
 
   const accountRows = await db.select().from(schema.modelAvailability)
     .innerJoin(schema.accounts, eq(schema.modelAvailability.accountId, schema.accounts.id))
@@ -1045,11 +1141,15 @@ export async function rebuildTokenRoutesFromAvailability() {
     return !!disabled && disabled.has(modelName);
   }
 
+  // Load global brand filter
+  const blockedBrandRules = getBlockedBrandRules(config.globalBlockedBrands);
+
   const modelCandidates = new Map<string, Map<string, { accountId: number; tokenId: number | null }>>();
   const addModelCandidate = (modelNameRaw: string | null | undefined, accountId: number, tokenId: number | null, siteId: number) => {
     const modelName = (modelNameRaw || '').trim();
     if (!modelName) return;
     if (isModelDisabledForSite(siteId, modelName)) return;
+    if (blockedBrandRules.length > 0 && isModelBlockedByBrand(modelName, blockedBrandRules)) return;
     if (!modelCandidates.has(modelName)) modelCandidates.set(modelName, new Map());
     const candidateKey = `${accountId}:${tokenId ?? 'account'}`;
     modelCandidates.get(modelName)!.set(candidateKey, { accountId, tokenId });

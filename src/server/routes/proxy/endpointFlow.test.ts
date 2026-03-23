@@ -73,6 +73,7 @@ describe('executeEndpointFlow', () => {
 
     expect(result.ok).toBe(true);
     expect(dispatchRequest).toHaveBeenCalledTimes(1);
+    expect(dispatchRequest.mock.calls[0]?.[1]).toBe('https://example.com/v1/responses');
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
@@ -297,7 +298,6 @@ describe('executeEndpointFlow', () => {
 
     expect(fetchMock.mock.calls[0]?.[0]).toBe('https://proxy.internal/base/v1/responses');
   });
-
   it('returns normalized final error when all endpoints fail', async () => {
     fetchMock.mockResolvedValueOnce(toUndiciResponse(new Response(JSON.stringify({
       error: { message: 'upstream_error', type: 'upstream_error' },

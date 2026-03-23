@@ -1,12 +1,23 @@
 import { FastifyInstance } from 'fastify';
 import cron from 'node-cron';
+import { fetch } from 'undici';
 import { config } from '../../config.js';
 import { db, runtimeDbDialect, schema } from '../../db/index.js';
 import { upsertSetting } from '../../db/upsertSetting.js';
 import { refreshModelsAndRebuildRoutes } from '../../services/modelService.js';
+import { getAllBrandNames } from '../../services/brandMatcher.js';
 import { updateBalanceRefreshCron, updateCheckinSchedule, updateLogCleanupSettings } from '../../services/checkinScheduler.js';
 import { sendNotification } from '../../services/notifyService.js';
-import { exportBackup, importBackup, type BackupExportType } from '../../services/backupService.js';
+import {
+  exportBackup,
+  exportBackupToWebdav,
+  getBackupWebdavConfig,
+  importBackup,
+  importBackupFromWebdav,
+  reloadBackupWebdavScheduler,
+  saveBackupWebdavConfig,
+  type BackupExportType,
+} from '../../services/backupService.js';
 import { startBackgroundTask } from '../../services/backgroundTaskService.js';
 import {
   maskConnectionString,
@@ -17,7 +28,7 @@ import {
 } from '../../services/databaseMigrationService.js';
 import { formatUtcSqlDateTime, getResolvedTimeZone } from '../../services/localTimeService.js';
 import { extractClientIp, isIpAllowed } from '../../middleware/auth.js';
-import { invalidateSiteProxyCache, normalizeSiteProxyUrl } from '../../services/siteProxy.js';
+import { invalidateSiteProxyCache, normalizeSiteProxyUrl, withExplicitProxyRequestInit } from '../../services/siteProxy.js';
 import { performFactoryReset } from '../../services/factoryResetService.js';
 import { normalizeLogCleanupRetentionDays } from '../../services/logCleanupService.js';
 import { stopProxyLogRetentionService } from '../../services/proxyLogRetentionService.js';
@@ -61,6 +72,7 @@ interface RuntimeSettingsBody {
   routingWeights?: Partial<RoutingWeights>;
   proxyErrorKeywords?: string[] | string;
   proxyEmptyContentFailEnabled?: boolean;
+  globalBlockedBrands?: string[];
 }
 
 interface DatabaseMigrationBody {
@@ -68,6 +80,21 @@ interface DatabaseMigrationBody {
   connectionString?: unknown;
   overwrite?: unknown;
   ssl?: unknown;
+}
+
+interface SystemProxyTestBody {
+  proxyUrl?: unknown;
+}
+
+interface BackupWebdavConfigBody {
+  enabled?: unknown;
+  fileUrl?: unknown;
+  username?: unknown;
+  password?: unknown;
+  clearPassword?: unknown;
+  exportType?: unknown;
+  autoSyncEnabled?: unknown;
+  autoSyncCron?: unknown;
 }
 
 type RuntimeDatabaseConfig = {
@@ -80,6 +107,8 @@ const PROXY_TOKEN_PREFIX = 'sk-';
 const DB_TYPE_SETTING_KEY = 'db_type';
 const DB_URL_SETTING_KEY = 'db_url';
 const DB_SSL_SETTING_KEY = 'db_ssl';
+const SYSTEM_PROXY_TEST_PROBE_URL = 'https://www.gstatic.com/generate_204';
+const SYSTEM_PROXY_TEST_TIMEOUT_MS = 15_000;
 
 function isValidProxyToken(value: string): boolean {
   return value.startsWith(PROXY_TOKEN_PREFIX) && value.length >= 6;
@@ -116,6 +145,94 @@ function toPositiveNumberOrFallback(value: unknown, fallback: number) {
   const n = Number(value);
   if (!Number.isFinite(n) || n < 0) return fallback;
   return n;
+}
+
+function extractNestedErrorMessages(error: unknown): string[] {
+  const messages: string[] = [];
+  const visited = new Set<unknown>();
+  let current: any = error;
+
+  while (current && !visited.has(current)) {
+    visited.add(current);
+    const message = typeof current?.message === 'string' ? current.message.trim() : '';
+    if (message) {
+      messages.push(message);
+    }
+    current = current?.cause;
+  }
+
+  return messages;
+}
+
+function describeSystemProxyTestFailure(error: unknown): string {
+  const messages = extractNestedErrorMessages(error);
+  const detail = messages.find((message) => message && message !== 'fetch failed')
+    || messages[0]
+    || '未知错误';
+
+  if (/ECONNREFUSED/i.test(detail)) {
+    return '系统代理测试失败：连接被拒绝，请检查代理地址、端口和本地代理程序是否已启动';
+  }
+
+  if (/ETIMEDOUT|timed out|timeout/i.test(detail)) {
+    return '系统代理测试失败：连接超时，请检查代理服务或当前网络是否可用';
+  }
+
+  if (/ENOTFOUND|EAI_AGAIN/i.test(detail)) {
+    return '系统代理测试失败：域名解析失败，请检查网络或代理的 DNS 配置';
+  }
+
+  if (/ECONNRESET/i.test(detail)) {
+    return '系统代理测试失败：连接被对端重置，请检查代理链路是否稳定';
+  }
+
+  if (/407/.test(detail) || /proxy authentication/i.test(detail)) {
+    return '系统代理测试失败：代理要求认证，请检查用户名、密码或代理配置';
+  }
+
+  return `系统代理测试失败：${detail}`;
+}
+
+async function testSystemProxyConnectivity(proxyUrl: string) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), SYSTEM_PROXY_TEST_TIMEOUT_MS);
+  const startedAt = Date.now();
+
+  try {
+    const response = await fetch(
+      SYSTEM_PROXY_TEST_PROBE_URL,
+      withExplicitProxyRequestInit(proxyUrl, {
+        method: 'GET',
+        signal: controller.signal,
+        headers: {
+          'cache-control': 'no-cache',
+          'user-agent': 'metapi-system-proxy-tester/1.0',
+        },
+      }),
+    );
+
+    try {
+      await response.arrayBuffer();
+    } catch {
+      // Ignore body drain failures; reachability is determined by receiving a response.
+    }
+
+    return {
+      reachable: true,
+      ok: response.ok,
+      statusCode: response.status,
+      latencyMs: Math.max(1, Date.now() - startedAt),
+      probeUrl: SYSTEM_PROXY_TEST_PROBE_URL,
+      finalUrl: response.url || SYSTEM_PROXY_TEST_PROBE_URL,
+    };
+  } catch (error: any) {
+    if (error?.name === 'AbortError') {
+      throw new Error(`系统代理测试超时（${Math.round(SYSTEM_PROXY_TEST_TIMEOUT_MS / 1000)}s）`);
+    }
+    throw new Error(describeSystemProxyTestFailure(error));
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 function toStringList(value: unknown): string[] {
@@ -275,6 +392,29 @@ function applyImportedSettingToRuntime(key: string, value: unknown) {
     case 'proxy_empty_content_fail_enabled': {
       try {
         config.proxyEmptyContentFailEnabled = parseBooleanFlag(value, '空内容判定失败开关');
+      } catch {
+        return;
+      }
+      return;
+    }
+    case 'global_blocked_brands': {
+      try {
+        const parsed = typeof value === 'string' ? JSON.parse(value) : value;
+        if (Array.isArray(parsed)) {
+          const nextBrands = parsed.filter((b): b is string => typeof b === 'string').map((b) => b.trim()).filter(Boolean);
+          const prev = JSON.stringify(config.globalBlockedBrands);
+          config.globalBlockedBrands = nextBrands;
+          if (prev !== JSON.stringify(nextBrands)) {
+            startBackgroundTask(
+              {
+                type: 'maintenance',
+                title: '品牌屏蔽变更后重建路由',
+                dedupeKey: 'refresh-models-and-rebuild-routes',
+              },
+              async () => refreshModelsAndRebuildRoutes(),
+            );
+          }
+        }
       } catch {
         return;
       }
@@ -447,6 +587,7 @@ function getRuntimeSettingsResponse(currentAdminIp = '') {
     proxyErrorKeywords: config.proxyErrorKeywords,
     proxyEmptyContentFailEnabled: config.proxyEmptyContentFailEnabled,
     proxyTokenMasked: maskSecret(config.proxyToken),
+    globalBlockedBrands: config.globalBlockedBrands,
   };
 }
 
@@ -522,6 +663,47 @@ export async function settingsRoutes(app: FastifyInstance) {
   await app.get('/api/settings/runtime', async (request) => {
     const currentAdminIp = extractClientIp(request.ip, request.headers['x-forwarded-for']);
     return getRuntimeSettingsResponse(currentAdminIp);
+  });
+
+  app.get('/api/settings/brand-list', async () => {
+    return { brands: getAllBrandNames() };
+  });
+
+  app.post<{ Body: SystemProxyTestBody }>('/api/settings/system-proxy/test', async (request, reply) => {
+    const rawProxyUrl = request.body?.proxyUrl === undefined
+      ? config.systemProxyUrl
+      : String(request.body.proxyUrl || '').trim();
+    const normalizedProxyUrl = rawProxyUrl
+      ? normalizeSiteProxyUrl(rawProxyUrl)
+      : '';
+
+    if (!rawProxyUrl) {
+      return reply.code(400).send({
+        success: false,
+        message: '请先填写系统代理地址',
+      });
+    }
+
+    if (!normalizedProxyUrl) {
+      return reply.code(400).send({
+        success: false,
+        message: '系统代理地址无效，请填写合法的 http(s)/socks 代理 URL',
+      });
+    }
+
+    try {
+      const result = await testSystemProxyConnectivity(normalizedProxyUrl);
+      return {
+        success: true,
+        proxyUrl: normalizedProxyUrl,
+        ...result,
+      };
+    } catch (error: any) {
+      return reply.code(502).send({
+        success: false,
+        message: error?.message || '系统代理测试失败',
+      });
+    }
   });
 
   app.put<{ Body: RuntimeSettingsBody }>('/api/settings/runtime', async (request, reply) => {
@@ -792,6 +974,31 @@ export async function settingsRoutes(app: FastifyInstance) {
       }
       config.proxyEmptyContentFailEnabled = nextValue;
       upsertSetting('proxy_empty_content_fail_enabled', config.proxyEmptyContentFailEnabled);
+    }
+
+    if (body.globalBlockedBrands !== undefined) {
+      if (!Array.isArray(body.globalBlockedBrands)) {
+        return reply.code(400).send({ error: 'globalBlockedBrands must be an array of strings' });
+      }
+      const nextBrands = body.globalBlockedBrands.filter((b): b is string => typeof b === 'string').map((b) => b.trim()).filter(Boolean);
+      const uniqueBrands = Array.from(new Set(nextBrands));
+      const prev = JSON.stringify(config.globalBlockedBrands);
+      const next = JSON.stringify(uniqueBrands);
+      if (prev !== next) {
+        changedLabels.push('全局品牌屏蔽');
+      }
+      config.globalBlockedBrands = uniqueBrands;
+      upsertSetting('global_blocked_brands', JSON.stringify(uniqueBrands));
+      if (prev !== next) {
+        startBackgroundTask(
+          {
+            type: 'maintenance',
+            title: '品牌屏蔽变更后重建路由',
+            dedupeKey: 'refresh-models-and-rebuild-routes',
+          },
+          async () => refreshModelsAndRebuildRoutes(),
+        );
+      }
     }
 
     if (body.webhookUrl !== undefined) {
@@ -1135,6 +1342,9 @@ export async function settingsRoutes(app: FastifyInstance) {
       for (const item of result.appliedSettings) {
         applyImportedSettingToRuntime(item.key, item.value);
       }
+      if (result.appliedSettings.some((item) => item.key === 'backup_webdav_config_v1')) {
+        await reloadBackupWebdavScheduler();
+      }
       return {
         success: true,
         message: '导入完成',
@@ -1144,6 +1354,65 @@ export async function settingsRoutes(app: FastifyInstance) {
       return reply.code(400).send({
         success: false,
         message: err?.message || '导入失败',
+      });
+    }
+  });
+
+  app.get('/api/settings/backup/webdav', async () => {
+    return getBackupWebdavConfig();
+  });
+
+  app.put<{ Body: BackupWebdavConfigBody }>('/api/settings/backup/webdav', async (request, reply) => {
+    try {
+      const body = request.body || {};
+      const result = await saveBackupWebdavConfig({
+        enabled: body.enabled === undefined ? undefined : body.enabled === true,
+        fileUrl: body.fileUrl === undefined ? undefined : String(body.fileUrl || ''),
+        username: body.username === undefined ? undefined : String(body.username || ''),
+        password: body.password === undefined ? undefined : String(body.password),
+        clearPassword: body.clearPassword === true,
+        exportType: body.exportType === undefined ? undefined : String(body.exportType || '') as BackupExportType,
+        autoSyncEnabled: body.autoSyncEnabled === undefined ? undefined : body.autoSyncEnabled === true,
+        autoSyncCron: body.autoSyncCron === undefined ? undefined : String(body.autoSyncCron || ''),
+      });
+      return result;
+    } catch (err: any) {
+      return reply.code(400).send({
+        success: false,
+        message: err?.message || 'WebDAV 配置保存失败',
+      });
+    }
+  });
+
+  app.post<{ Body: { type?: string } }>('/api/settings/backup/webdav/export', async (request, reply) => {
+    try {
+      const rawType = typeof request.body?.type === 'string' ? request.body.type.trim().toLowerCase() : '';
+      const type: BackupExportType | undefined = rawType === 'all' || rawType === 'accounts' || rawType === 'preferences'
+        ? rawType
+        : undefined;
+      return await exportBackupToWebdav(type);
+    } catch (err: any) {
+      return reply.code(400).send({
+        success: false,
+        message: err?.message || 'WebDAV 导出失败',
+      });
+    }
+  });
+
+  app.post('/api/settings/backup/webdav/import', async (_, reply) => {
+    try {
+      const result = await importBackupFromWebdav();
+      for (const item of result.appliedSettings) {
+        applyImportedSettingToRuntime(item.key, item.value);
+      }
+      if (result.appliedSettings.some((item) => item.key === 'backup_webdav_config_v1')) {
+        await reloadBackupWebdavScheduler();
+      }
+      return result;
+    } catch (err: any) {
+      return reply.code(400).send({
+        success: false,
+        message: err?.message || 'WebDAV 导入失败',
       });
     }
   });

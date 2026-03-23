@@ -42,7 +42,10 @@ export type EndpointPreference = DownstreamFormat | 'responses';
 type EndpointCapabilityProfile = {
   modelKey: string;
   preferMessagesForClaudeModel: boolean;
+  hasImageInput: boolean;
+  hasAudioInput: boolean;
   hasNonImageFileInput: boolean;
+  hasRemoteDocumentUrl: boolean;
   wantsNativeResponsesReasoning: boolean;
 };
 
@@ -451,7 +454,7 @@ function buildClaudeRuntimeHeaders(input: {
     'User-Agent': getInputHeader(input.claudeHeaders, 'user-agent') || CLAUDE_DEFAULT_USER_AGENT,
     Connection: 'keep-alive',
     Accept: input.stream ? 'text/event-stream' : 'application/json',
-    'Accept-Encoding': input.stream ? 'identity' : 'gzip, deflate, br, zstd',
+    'Accept-Encoding': 'gzip, deflate, br, zstd',
   };
   if (input.isClaudeOauthUpstream) {
     headers.Authorization = `Bearer ${input.tokenValue}`;
@@ -477,6 +480,106 @@ function ensureStreamAcceptHeader(
     ...headers,
     accept: 'text/event-stream',
   };
+}
+
+function normalizeResponsesFallbackChatFunctionTool(rawTool: unknown): Record<string, unknown> | null {
+  if (!isRecord(rawTool)) return null;
+  if (asTrimmedString(rawTool.type).toLowerCase() !== 'function') return null;
+
+  if (isRecord(rawTool.function)) {
+    const name = asTrimmedString(rawTool.function.name);
+    if (!name) return null;
+    return {
+      ...rawTool,
+      type: 'function',
+      function: {
+        ...rawTool.function,
+        name,
+      },
+    };
+  }
+
+  const name = asTrimmedString(rawTool.name);
+  if (!name) return null;
+
+  const fn: Record<string, unknown> = { name };
+  const description = asTrimmedString(rawTool.description);
+  if (description) fn.description = description;
+  if (rawTool.parameters !== undefined) fn.parameters = rawTool.parameters;
+  if (rawTool.strict !== undefined) fn.strict = rawTool.strict;
+
+  return {
+    type: 'function',
+    function: fn,
+  };
+}
+
+function normalizeResponsesFallbackChatToolChoice(
+  rawToolChoice: unknown,
+  allowedToolNames: Set<string>,
+): unknown {
+  if (rawToolChoice === undefined) return undefined;
+
+  if (typeof rawToolChoice === 'string') {
+    const normalized = rawToolChoice.trim().toLowerCase();
+    if (normalized === 'none') return 'none';
+    if (allowedToolNames.size <= 0) return undefined;
+    if (normalized === 'auto' || normalized === 'required') return normalized;
+    return undefined;
+  }
+
+  if (!isRecord(rawToolChoice)) return undefined;
+  if (asTrimmedString(rawToolChoice.type).toLowerCase() !== 'function') return undefined;
+
+  const nestedFunction = isRecord(rawToolChoice.function) ? rawToolChoice.function : null;
+  const name = asTrimmedString(nestedFunction?.name ?? rawToolChoice.name);
+  if (!name || !allowedToolNames.has(name)) return undefined;
+
+  return {
+    type: 'function',
+    function: {
+      ...(nestedFunction || {}),
+      name,
+    },
+  };
+}
+
+function sanitizeResponsesFallbackChatBody(
+  body: Record<string, unknown>,
+): Record<string, unknown> {
+  const next: Record<string, unknown> = { ...body };
+  const normalizedTools = Array.isArray(body.tools)
+    ? body.tools
+      .map((tool) => normalizeResponsesFallbackChatFunctionTool(tool))
+      .filter((tool): tool is Record<string, unknown> => !!tool)
+    : [];
+
+  if (normalizedTools.length > 0) {
+    next.tools = normalizedTools;
+  } else {
+    delete next.tools;
+  }
+
+  const allowedToolNames = new Set(
+    normalizedTools
+      .map((tool) => (
+        isRecord(tool.function)
+          ? asTrimmedString(tool.function.name)
+          : ''
+      ))
+      .filter((name) => name.length > 0),
+  );
+  const normalizedToolChoice = normalizeResponsesFallbackChatToolChoice(
+    body.tool_choice,
+    allowedToolNames,
+  );
+  if (normalizedToolChoice !== undefined) {
+    next.tool_choice = normalizedToolChoice;
+  } else {
+    delete next.tool_choice;
+  }
+
+  return next;
 }
 
 function toFiniteNumber(value: unknown): number | null {
@@ -619,18 +722,34 @@ function buildEndpointCapabilityProfile(input?: {
     wantsNativeResponsesReasoning?: boolean;
   };
 }): EndpointCapabilityProfile {
+  const conversationFileSummary = input?.requestCapabilities?.conversationFileSummary;
   return {
     modelKey: normalizeEndpointRuntimeModelKey(input?.modelName, input?.requestedModelHint),
     preferMessagesForClaudeModel: (
       isClaudeFamilyModel(asTrimmedString(input?.modelName))
       || isClaudeFamilyModel(asTrimmedString(input?.requestedModelHint))
     ),
+    hasImageInput: conversationFileSummary?.hasImage === true,
+    hasAudioInput: conversationFileSummary?.hasAudio === true,
     hasNonImageFileInput: (
-      input?.requestCapabilities?.conversationFileSummary?.hasDocument === true
+      conversationFileSummary?.hasDocument === true
       || input?.requestCapabilities?.hasNonImageFileInput === true
+    ),
+    hasRemoteDocumentUrl: (
+      conversationFileSummary?.hasRemoteDocumentUrl === true
     ),
     wantsNativeResponsesReasoning: input?.requestCapabilities?.wantsNativeResponsesReasoning === true,
   };
+}
+
+function shouldUseEndpointRuntimeMemory(capabilityProfile: EndpointCapabilityProfile): boolean {
+  // Attachment-capable requests are not protocol-equivalent across chat/messages/responses.
+  // A transient 200 on one endpoint should not bias later multimodal requests onto a lossy path.
+  return (
+    !capabilityProfile.hasImageInput
+    && !capabilityProfile.hasAudioInput
+    && !capabilityProfile.hasNonImageFileInput
+  );
 }
 
 function buildEndpointRuntimeStateKey(input: {
@@ -644,6 +763,7 @@ function buildEndpointRuntimeStateKey(input: {
     input.downstreamFormat,
     capabilityProfile.modelKey,
     capabilityProfile.hasNonImageFileInput ? 'files' : 'nofiles',
+    capabilityProfile.hasRemoteDocumentUrl ? 'remoteurl' : 'noremoteurl',
     capabilityProfile.wantsNativeResponsesReasoning ? 'reasoning' : 'noreasoning',
   ].join(':');
 }
@@ -724,13 +844,35 @@ function inferSuggestedEndpointFromError(errorText?: string | null): UpstreamEnd
 
 function shouldBlockEndpointByError(status: number, errorText?: string | null): boolean {
   if (isEndpointDispatchDeniedError(status, errorText)) return true;
-  if (isEndpointDowngradeError(status, errorText)) return true;
+  if (status === 404 || status === 405 || status === 415 || status === 501) return true;
+  if (isUnsupportedMediaTypeError(status, errorText)) return true;
+
   const text = (errorText || '').toLowerCase();
   return (
-    text.includes('unsupported legacy protocol')
+    text.includes('convert_request_failed')
+    || text.includes('endpoint_not_found')
+    || text.includes('unknown_endpoint')
+    || text.includes('unsupported_endpoint')
+    || text.includes('unsupported_path')
+    || text.includes('not_found_error')
+    || text.includes('unsupported legacy protocol')
     || text.includes('please use /v1/')
     || text.includes('does not allow /v1/')
+    || text.includes('unknown endpoint')
+    || text.includes('unsupported endpoint')
+    || text.includes('unsupported path')
+    || text.includes('unrecognized request url')
+    || text.includes('no route matched')
+    || text.includes('does not exist')
   );
+}
+
+function shouldRememberSuccessfulEndpoint(input: {
+  endpoint: UpstreamEndpoint;
+  downstreamFormat: EndpointPreference;
+}): boolean {
+  if (input.downstreamFormat !== 'responses') return true;
+  return input.endpoint === 'responses';
 }
 
 export function resetUpstreamEndpointRuntimeState(): void {
@@ -749,15 +891,19 @@ export function recordUpstreamEndpointSuccess(input: {
     wantsNativeResponsesReasoning?: boolean;
   };
 }): void {
+  const capabilityProfile = buildEndpointCapabilityProfile({
+    modelName: input.modelName,
+    requestedModelHint: input.requestedModelHint,
+    requestCapabilities: input.requestCapabilities,
+  });
+  if (!shouldUseEndpointRuntimeMemory(capabilityProfile)) return;
+  if (!shouldRememberSuccessfulEndpoint(input)) return;
+
   const nowMs = Date.now();
   const key = buildEndpointRuntimeStateKey({
     siteId: input.siteId,
     downstreamFormat: input.downstreamFormat,
-    capabilityProfile: buildEndpointCapabilityProfile({
-      modelName: input.modelName,
-      requestedModelHint: input.requestedModelHint,
-      requestCapabilities: input.requestCapabilities,
-    }),
+    capabilityProfile,
   });
   const state = getOrCreateEndpointRuntimeState(key, nowMs);
   state.preferredEndpoint = input.endpoint;
@@ -779,17 +925,19 @@ export function recordUpstreamEndpointFailure(input: {
     wantsNativeResponsesReasoning?: boolean;
   };
 }): void {
+  const capabilityProfile = buildEndpointCapabilityProfile({
+    modelName: input.modelName,
+    requestedModelHint: input.requestedModelHint,
+    requestCapabilities: input.requestCapabilities,
+  });
+  if (!shouldUseEndpointRuntimeMemory(capabilityProfile)) return;
   if (!shouldBlockEndpointByError(input.status, input.errorText)) return;
 
   const nowMs = Date.now();
   const key = buildEndpointRuntimeStateKey({
     siteId: input.siteId,
     downstreamFormat: input.downstreamFormat,
-    capabilityProfile: buildEndpointCapabilityProfile({
-      modelName: input.modelName,
-      requestedModelHint: input.requestedModelHint,
-      requestCapabilities: input.requestCapabilities,
-    }),
+    capabilityProfile,
   });
   const state = getOrCreateEndpointRuntimeState(key, nowMs);
   state.blockedUntilMsByEndpoint[input.endpoint] = nowMs + ENDPOINT_RUNTIME_BLOCK_TTL_MS;
@@ -890,7 +1038,9 @@ export async function resolveUpstreamEndpointCandidates(
     capabilityProfile,
   });
   const applyRuntimePreference = (candidates: UpstreamEndpoint[]) => (
-    applyEndpointRuntimePreference(candidates, runtimeStateKey)
+    shouldUseEndpointRuntimeMemory(capabilityProfile)
+      ? applyEndpointRuntimePreference(candidates, runtimeStateKey)
+      : candidates
   );
   const conversationFileSummary = requestCapabilities?.conversationFileSummary ?? {
     hasImage: false,
@@ -1355,14 +1505,20 @@ export function buildUpstreamEndpointRequest(input: {
   }
 
   const headers = ensureStreamAcceptHeader(commonHeaders, input.stream);
+  const chatBody = {
+    ...openaiBody,
+    model: input.modelName,
+    stream: input.stream,
+  };
+  const configuredChatBody = applyConfiguredPayloadRules(
+    input.downstreamFormat === 'responses'
+      ? sanitizeResponsesFallbackChatBody(chatBody)
+      : chatBody,
+  );
   return {
     path: resolveEndpointPath('chat'),
     headers,
-    body: applyConfiguredPayloadRules({
-      ...openaiBody,
-      model: input.modelName,
-      stream: input.stream,
-    }),
+    body: configuredChatBody,
     runtime,
   };
 }
@@ -1396,32 +1552,60 @@ export function buildClaudeCountTokensUpstreamRequest(input: {
   delete sanitizedBody.maxTokens;
   delete sanitizedBody.stream;
   const providerProfile = resolveProviderProfile(sitePlatform);
-  if (providerProfile?.id !== 'claude') {
-    throw new Error(`missing claude provider profile for platform: ${sitePlatform || 'unknown'}`);
+  const effectiveClaudeHeaders = {
+    ...claudeHeaders,
+    ...(betas.length > 0 ? { 'anthropic-beta': betas.join(',') } : {}),
+  };
+
+  if (providerProfile?.id === 'claude') {
+    const prepared = providerProfile.prepareRequest({
+      endpoint: 'messages',
+      modelName: input.modelName,
+      stream: false,
+      tokenValue: input.tokenValue,
+      oauthProvider: input.oauthProvider,
+      sitePlatform,
+      baseHeaders: {
+        'Content-Type': 'application/json',
+      },
+      claudeHeaders: effectiveClaudeHeaders,
+      body: sanitizedBody,
+      action: 'countTokens',
+    });
+
+    return {
+      path: prepared.path,
+      headers: prepared.headers,
+      body: prepared.body,
+      runtime: {
+        executor: 'claude',
+        modelName: input.modelName,
+        stream: false,
+        action: 'countTokens',
+      },
+    };
   }
 
-  const prepared = providerProfile.prepareRequest({
-    endpoint: 'messages',
-    modelName: input.modelName,
-    stream: false,
-    tokenValue: input.tokenValue,
-    oauthProvider: input.oauthProvider,
-    sitePlatform,
+  const anthropicVersion = (
+    effectiveClaudeHeaders['anthropic-version']
+    || '2023-06-01'
+  );
+  const isClaudeOauthUpstream = sitePlatform === 'claude' && input.oauthProvider === 'claude';
+  const headers = buildClaudeRuntimeHeaders({
     baseHeaders: {
       'Content-Type': 'application/json',
     },
-    claudeHeaders: {
-      ...claudeHeaders,
-      ...(betas.length > 0 ? { 'anthropic-beta': betas.join(',') } : {}),
-    },
-    body: sanitizedBody,
-    action: 'countTokens',
+    claudeHeaders: effectiveClaudeHeaders,
+    anthropicVersion,
+    stream: false,
+    isClaudeOauthUpstream,
+    tokenValue: input.tokenValue,
   });
 
   return {
-    path: prepared.path,
-    headers: prepared.headers,
-    body: prepared.body,
+    path: '/v1/messages/count_tokens?beta=true',
+    headers,
+    body: sanitizedBody,
     runtime: {
       executor: 'claude',
       modelName: input.modelName,

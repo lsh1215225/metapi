@@ -19,6 +19,16 @@ function buildJwt(payload: Record<string, unknown>) {
   return `${encode({ alg: 'none', typ: 'JWT' })}.${encode(payload)}.signature`;
 }
 
+function createDeferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
 describe('oauth routes', { timeout: 15_000 }, () => {
   let app: FastifyInstance;
   let db: DbModule['db'];
@@ -500,6 +510,265 @@ describe('oauth routes', { timeout: 15_000 }, () => {
     });
   });
 
+  it('keeps the existing codex connection intact when a rebind callback fails model discovery', async () => {
+    const originalJwt = buildJwt({
+      email: 'codex-existing@example.com',
+      'https://api.openai.com/auth': {
+        chatgpt_account_id: 'chatgpt-account-existing',
+        chatgpt_plan_type: 'team',
+      },
+    });
+    const site = await db.insert(schema.sites).values({
+      name: 'ChatGPT Codex OAuth',
+      url: 'https://chatgpt.com/backend-api/codex',
+      platform: 'codex',
+      status: 'active',
+    }).returning().get();
+    const existing = await db.insert(schema.accounts).values({
+      siteId: site.id,
+      username: 'codex-existing@example.com',
+      accessToken: 'stable-access-token',
+      apiToken: null,
+      status: 'active',
+      oauthProvider: 'codex',
+      oauthAccountKey: 'chatgpt-account-existing',
+      extraConfig: JSON.stringify({
+        credentialMode: 'session',
+        oauth: {
+          provider: 'codex',
+          accountId: 'chatgpt-account-existing',
+          accountKey: 'chatgpt-account-existing',
+          email: 'codex-existing@example.com',
+          planType: 'team',
+          refreshToken: 'stable-refresh-token',
+          idToken: originalJwt,
+        },
+      }),
+    }).returning().get();
+
+    const reboundJwt = buildJwt({
+      email: 'codex-existing@example.com',
+      'https://api.openai.com/auth': {
+        chatgpt_account_id: 'chatgpt-account-rebound',
+        chatgpt_plan_type: 'plus',
+      },
+    });
+    fetchMock
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({
+          access_token: 'rebound-access-token',
+          refresh_token: 'rebound-refresh-token',
+          id_token: reboundJwt,
+          expires_in: 3600,
+          token_type: 'Bearer',
+        }),
+        text: async () => JSON.stringify({ ok: true }),
+      })
+      .mockResolvedValueOnce({
+        ok: false,
+        status: 403,
+        json: async () => ({ error: 'forbidden' }),
+        text: async () => 'forbidden',
+      });
+
+    const startResponse = await app.inject({
+      method: 'POST',
+      url: '/api/oauth/providers/codex/start',
+      headers: {
+        host: 'metapi.example',
+        'x-forwarded-proto': 'https',
+      },
+      payload: {
+        accountId: existing.id,
+      },
+    });
+    const startBody = startResponse.json() as { state: string };
+
+    const callbackResponse = await app.inject({
+      method: 'POST',
+      url: `/api/oauth/sessions/${encodeURIComponent(startBody.state)}/manual-callback`,
+      payload: {
+        callbackUrl: `http://localhost:1455/auth/callback?state=${encodeURIComponent(startBody.state)}&code=oauth-code-rebind-fail`,
+      },
+    });
+    expect(callbackResponse.statusCode).toBe(500);
+
+    const stored = await db.select().from(schema.accounts).where(eq(schema.accounts.id, existing.id)).get();
+    expect(stored).toMatchObject({
+      id: existing.id,
+      username: 'codex-existing@example.com',
+      accessToken: 'stable-access-token',
+      oauthAccountKey: 'chatgpt-account-existing',
+    });
+    expect(JSON.parse(stored?.extraConfig || '{}')).toMatchObject({
+      oauth: {
+        accountId: 'chatgpt-account-existing',
+        refreshToken: 'stable-refresh-token',
+        idToken: originalJwt,
+      },
+    });
+
+    const accounts = await db.select().from(schema.accounts).all();
+    expect(accounts).toHaveLength(1);
+    expect(accounts[0]?.oauthAccountKey).toBe('chatgpt-account-existing');
+  });
+
+  it('keeps the existing codex account non-active while rebind model discovery is still pending', async () => {
+    const originalJwt = buildJwt({
+      email: 'codex-existing@example.com',
+      'https://api.openai.com/auth': {
+        chatgpt_account_id: 'chatgpt-account-existing',
+        chatgpt_plan_type: 'team',
+      },
+    });
+    const site = await db.insert(schema.sites).values({
+      name: 'ChatGPT Codex OAuth',
+      url: 'https://chatgpt.com/backend-api/codex',
+      platform: 'codex',
+      status: 'active',
+    }).returning().get();
+    const existing = await db.insert(schema.accounts).values({
+      siteId: site.id,
+      username: 'codex-existing@example.com',
+      accessToken: 'stable-access-token',
+      apiToken: null,
+      status: 'active',
+      oauthProvider: 'codex',
+      oauthAccountKey: 'chatgpt-account-existing',
+      extraConfig: JSON.stringify({
+        credentialMode: 'session',
+        oauth: {
+          provider: 'codex',
+          accountId: 'chatgpt-account-existing',
+          accountKey: 'chatgpt-account-existing',
+          email: 'codex-existing@example.com',
+          planType: 'team',
+          refreshToken: 'stable-refresh-token',
+          idToken: originalJwt,
+        },
+      }),
+    }).returning().get();
+
+    const reboundJwt = buildJwt({
+      email: 'codex-existing@example.com',
+      'https://api.openai.com/auth': {
+        chatgpt_account_id: 'chatgpt-account-rebound',
+        chatgpt_plan_type: 'plus',
+      },
+    });
+    const discoveryGate = createDeferred<ResponseLike>();
+    fetchMock
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({
+          access_token: 'rebound-access-token',
+          refresh_token: 'rebound-refresh-token',
+          id_token: reboundJwt,
+          expires_in: 3600,
+          token_type: 'Bearer',
+        }),
+        text: async () => JSON.stringify({ ok: true }),
+      })
+      .mockImplementationOnce(() => discoveryGate.promise);
+
+    const startResponse = await app.inject({
+      method: 'POST',
+      url: '/api/oauth/providers/codex/start',
+      headers: {
+        host: 'metapi.example',
+        'x-forwarded-proto': 'https',
+      },
+      payload: {
+        accountId: existing.id,
+      },
+    });
+    const startBody = startResponse.json() as { state: string };
+
+    const callbackPromise = app.inject({
+      method: 'POST',
+      url: `/api/oauth/sessions/${encodeURIComponent(startBody.state)}/manual-callback`,
+      payload: {
+        callbackUrl: `http://localhost:1455/auth/callback?state=${encodeURIComponent(startBody.state)}&code=oauth-code-rebind-pending`,
+      },
+    });
+
+    while (fetchMock.mock.calls.length < 2) {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+
+    const pendingRow = await db.select().from(schema.accounts).where(eq(schema.accounts.id, existing.id)).get();
+    expect(pendingRow?.status).toBe('disabled');
+
+    discoveryGate.resolve({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        models: [{ id: 'gpt-5.4' }],
+      }),
+      text: async () => JSON.stringify({ ok: true }),
+    } as ResponseLike);
+
+    const callbackResponse = await callbackPromise;
+    expect(callbackResponse.statusCode).toBe(200);
+
+    const stored = await db.select().from(schema.accounts).where(eq(schema.accounts.id, existing.id)).get();
+    expect(stored).toMatchObject({
+      id: existing.id,
+      status: 'active',
+      accessToken: 'rebound-access-token',
+      oauthAccountKey: 'chatgpt-account-rebound',
+    });
+  });
+
+  it('fails codex oauth onboarding when token exchange does not expose chatgpt_account_id', async () => {
+    const jwt = buildJwt({
+      email: 'codex-no-account@example.com',
+      'https://api.openai.com/auth': {
+        chatgpt_plan_type: 'plus',
+      },
+    });
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        access_token: 'oauth-access-token',
+        refresh_token: 'oauth-refresh-token',
+        id_token: jwt,
+        expires_in: 3600,
+        token_type: 'Bearer',
+      }),
+      text: async () => JSON.stringify({ ok: true }),
+    });
+
+    const startResponse = await app.inject({
+      method: 'POST',
+      url: '/api/oauth/providers/codex/start',
+      headers: {
+        host: 'metapi.example',
+        'x-forwarded-proto': 'https',
+      },
+    });
+    const startBody = startResponse.json() as { state: string };
+
+    const callbackResponse = await app.inject({
+      method: 'POST',
+      url: `/api/oauth/sessions/${encodeURIComponent(startBody.state)}/manual-callback`,
+      payload: {
+        callbackUrl: `http://localhost:1455/auth/callback?state=${encodeURIComponent(startBody.state)}&code=oauth-code-no-account-id`,
+      },
+    });
+    expect(callbackResponse.statusCode).toBe(500);
+    expect(callbackResponse.json()).toMatchObject({
+      message: expect.stringContaining('chatgpt_account_id'),
+    });
+
+    const accounts = await db.select().from(schema.accounts).all();
+    expect(accounts).toEqual([]);
+  });
+
   it('marks gemini oauth session as error when token exchange fails before account persistence', async () => {
     fetchMock.mockResolvedValueOnce({
       ok: false,
@@ -787,6 +1056,168 @@ describe('oauth routes', { timeout: 15_000 }, () => {
     expect(String(fetchMock.mock.calls[4]?.[0] || '')).toContain('/projects/gen-lang-client-0123456789/services/cloudaicompanion.googleapis.com');
     expect(String(fetchMock.mock.calls[5]?.[0] || '')).toContain('/projects/gen-lang-client-0123456789/services/cloudaicompanion.googleapis.com:enable');
     expect(String(fetchMock.mock.calls[7]?.[0] || '')).toContain('/projects/gen-lang-client-0123456789/services/cloudaicompanion.googleapis.com');
+  });
+
+  it('surfaces Cloud AI API enable failures during Gemini CLI oauth setup and keeps the account rolled back', async () => {
+    fetchMock
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({
+          access_token: 'gemini-access-token',
+          refresh_token: 'gemini-refresh-token',
+          expires_in: 3600,
+          token_type: 'Bearer',
+          scope: 'cloud-platform',
+        }),
+        text: async () => JSON.stringify({ ok: true }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({
+          projects: [
+            { projectId: 'project-enable-failure' },
+          ],
+        }),
+        text: async () => JSON.stringify({ ok: true }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({
+          cloudaicompanionProject: {
+            id: 'project-enable-failure',
+          },
+          allowedTiers: [
+            { id: 'legacy-tier', isDefault: true },
+          ],
+        }),
+        text: async () => JSON.stringify({ ok: true }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({
+          done: true,
+          response: {
+            cloudaicompanionProject: {
+              id: 'project-enable-failure',
+            },
+          },
+        }),
+        text: async () => JSON.stringify({ done: true }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({ state: 'DISABLED' }),
+        text: async () => JSON.stringify({ state: 'DISABLED' }),
+      })
+      .mockResolvedValueOnce({
+        ok: false,
+        status: 403,
+        json: async () => ({ error: { message: 'Permission denied for project-enable-failure' } }),
+        text: async () => JSON.stringify({ error: { message: 'Permission denied for project-enable-failure' } }),
+      });
+
+    const startResponse = await app.inject({
+      method: 'POST',
+      url: '/api/oauth/providers/gemini-cli/start',
+      headers: {
+        host: 'metapi.example',
+        'x-forwarded-proto': 'https',
+      },
+    });
+    expect(startResponse.statusCode).toBe(200);
+    const startBody = startResponse.json() as { state: string };
+
+    const callbackResponse = await app.inject({
+      method: 'POST',
+      url: `/api/oauth/sessions/${encodeURIComponent(startBody.state)}/manual-callback`,
+      payload: {
+        callbackUrl: `http://localhost:8085/oauth2callback?state=${encodeURIComponent(startBody.state)}&code=gemini-oauth-code-enable-failure`,
+      },
+    });
+    expect(callbackResponse.statusCode).toBe(500);
+    expect(callbackResponse.json()).toMatchObject({
+      message: expect.stringContaining('project activation required'),
+    });
+
+    const sessionResponse = await app.inject({
+      method: 'GET',
+      url: `/api/oauth/sessions/${startBody.state}`,
+    });
+    expect(sessionResponse.statusCode).toBe(200);
+    expect(sessionResponse.json()).toMatchObject({
+      provider: 'gemini-cli',
+      status: 'error',
+      error: expect.stringContaining('Permission denied for project-enable-failure'),
+    });
+
+    const accounts = await db.select().from(schema.accounts).all();
+    expect(accounts).toEqual([]);
+  });
+
+  it('fails Gemini CLI oauth setup when the Google account has no available Cloud projects', async () => {
+    fetchMock
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({
+          access_token: 'gemini-access-token',
+          refresh_token: 'gemini-refresh-token',
+          expires_in: 3600,
+          token_type: 'Bearer',
+          scope: 'cloud-platform',
+        }),
+        text: async () => JSON.stringify({ ok: true }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({
+          projects: [],
+        }),
+        text: async () => JSON.stringify({ ok: true }),
+      });
+
+    const startResponse = await app.inject({
+      method: 'POST',
+      url: '/api/oauth/providers/gemini-cli/start',
+      headers: {
+        host: 'metapi.example',
+        'x-forwarded-proto': 'https',
+      },
+    });
+    expect(startResponse.statusCode).toBe(200);
+    const startBody = startResponse.json() as { state: string };
+
+    const callbackResponse = await app.inject({
+      method: 'POST',
+      url: `/api/oauth/sessions/${encodeURIComponent(startBody.state)}/manual-callback`,
+      payload: {
+        callbackUrl: `http://localhost:8085/oauth2callback?state=${encodeURIComponent(startBody.state)}&code=gemini-oauth-code-no-projects`,
+      },
+    });
+    expect(callbackResponse.statusCode).toBe(500);
+    expect(callbackResponse.json()).toMatchObject({
+      message: 'no Google Cloud projects available for this account',
+    });
+
+    const sessionResponse = await app.inject({
+      method: 'GET',
+      url: `/api/oauth/sessions/${startBody.state}`,
+    });
+    expect(sessionResponse.statusCode).toBe(200);
+    expect(sessionResponse.json()).toMatchObject({
+      provider: 'gemini-cli',
+      status: 'error',
+      error: 'no Google Cloud projects available for this account',
+    });
+
+    const accounts = await db.select().from(schema.accounts).all();
+    expect(accounts).toEqual([]);
   });
 
   it('lists oauth connection health metadata and supports deleting the connection', async () => {

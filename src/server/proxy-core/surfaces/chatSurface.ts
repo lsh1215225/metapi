@@ -7,7 +7,7 @@ import { isTokenExpiredError } from '../../services/alertRules.js';
 import { shouldRetryProxyRequest } from '../../services/proxyRetryPolicy.js';
 import { resolveProxyUsageWithSelfLogFallback } from '../../services/proxyUsageFallbackService.js';
 import { mergeProxyUsage, parseProxyUsage } from '../../services/proxyUsageParser.js';
-import { resolveProxyUrlForSite, withSiteRecordProxyRequestInit } from '../../services/siteProxy.js';
+import { resolveChannelProxyUrl, withSiteRecordProxyRequestInit } from '../../services/siteProxy.js';
 import { type DownstreamFormat } from '../../transformers/shared/normalized.js';
 import {
   buildClaudeCountTokensUpstreamRequest,
@@ -24,6 +24,7 @@ import {
 import { composeProxyLogMessage } from '../../routes/proxy/logPathMeta.js';
 import { executeEndpointFlow, type BuiltEndpointRequest } from '../../routes/proxy/endpointFlow.js';
 import { detectProxyFailure } from '../../routes/proxy/proxyFailureJudge.js';
+import { buildUpstreamUrl } from '../../routes/proxy/upstreamUrl.js';
 import { formatUtcSqlDateTime } from '../../services/localTimeService.js';
 import { resolveProxyLogBilling } from '../../routes/proxy/proxyBilling.js';
 import { openAiChatTransformer } from '../../transformers/openai/chat/index.js';
@@ -203,6 +204,7 @@ export async function handleChatSurfaceRequest(
         runtime: endpointRequest.runtime,
       };
     };
+    const channelProxyUrl = resolveChannelProxyUrl(selected.site, selected.account.extraConfig);
     const dispatchRequest = (
       compatibilityRequest: BuiltEndpointRequest,
       targetUrl?: string,
@@ -215,7 +217,7 @@ export async function handleChatSurfaceRequest(
           method: 'POST',
           headers: requestForFetch.headers,
           body: JSON.stringify(requestForFetch.body),
-        }),
+        }, channelProxyUrl),
       })
     );
     const endpointStrategy = downstreamTransformer.compatibility.createEndpointStrategy({
@@ -232,7 +234,7 @@ export async function handleChatSurfaceRequest(
       dispatchRequest,
     });
     const tryRecover = async (ctx: Parameters<NonNullable<typeof endpointStrategy.tryRecover>>[0]) => {
-      if (ctx.response.status === 401 && oauth) {
+      if ((ctx.response.status === 401 || ctx.response.status === 403) && oauth) {
         try {
           const refreshed = await refreshOauthAccessTokenSingleflight(selected.account.id);
           selected.tokenValue = refreshed.accessToken;
@@ -242,7 +244,7 @@ export async function handleChatSurfaceRequest(
             extraConfig: refreshed.extraConfig ?? selected.account.extraConfig,
           };
           const refreshedRequest = buildEndpointRequest(ctx.request.endpoint);
-          const refreshedTargetUrl = `${selected.site.url}${refreshedRequest.path}`;
+          const refreshedTargetUrl = buildUpstreamUrl(selected.site.url, refreshedRequest.path);
           const refreshedResponse = await dispatchRequest(refreshedRequest, refreshedTargetUrl);
           if (refreshedResponse.ok) {
             return {
@@ -266,7 +268,6 @@ export async function handleChatSurfaceRequest(
     try {
         const endpointResult = await executeEndpointFlow({
           siteUrl: selected.site.url,
-          proxyUrl: resolveProxyUrlForSite(selected.site),
           endpointCandidates,
           buildRequest: (endpoint) => buildEndpointRequest(endpoint),
           dispatchRequest,
@@ -870,7 +871,17 @@ export async function handleClaudeCountTokensSurfaceRequest(
     }
 
     excludeChannelIds.push(selected.channel.id);
-    if (String(selected.site.platform || '').trim().toLowerCase() !== 'claude') {
+    const modelName = selected.actualModel || requestedModel;
+    const endpointCandidates = await resolveUpstreamEndpointCandidates(
+      {
+        site: selected.site,
+        account: selected.account,
+      },
+      modelName,
+      'claude',
+      requestedModel,
+    );
+    if (!endpointCandidates.includes('messages')) {
       if (retryCount < MAX_RETRIES) {
         retryCount += 1;
         continue;
@@ -882,8 +893,6 @@ export async function handleClaudeCountTokensSurfaceRequest(
         },
       });
     }
-
-    const modelName = selected.actualModel || requestedModel;
     const oauth = getOauthInfoFromExtraConfig(selected.account.extraConfig);
     const startTime = Date.now();
 
@@ -914,10 +923,10 @@ export async function handleClaudeCountTokensSurfaceRequest(
           method: 'POST',
           headers: requestForFetch.headers,
           body: JSON.stringify(requestForFetch.body),
-        }),
+        }, resolveChannelProxyUrl(selected.site, selected.account.extraConfig)),
       });
 
-      if (upstream.status === 401 && oauth) {
+      if ((upstream.status === 401 || upstream.status === 403) && oauth) {
         try {
           const refreshed = await refreshOauthAccessTokenSingleflight(selected.account.id);
           selected.tokenValue = refreshed.accessToken;
@@ -934,7 +943,7 @@ export async function handleClaudeCountTokensSurfaceRequest(
               method: 'POST',
               headers: requestForFetch.headers,
               body: JSON.stringify(requestForFetch.body),
-            }),
+            }, resolveChannelProxyUrl(selected.site, selected.account.extraConfig)),
           });
         } catch {
           // Fall through to the regular upstream error handling below.

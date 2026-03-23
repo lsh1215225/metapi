@@ -110,6 +110,36 @@ describe('detectDownstreamClientContext', () => {
     });
   });
 
+  it('prefers explicit self-reported client names before protocol-family fallbacks', () => {
+    expect(detectDownstreamClientContext({
+      downstreamPath: '/v1/responses',
+      headers: {
+        'openai-beta': 'responses-2025-03-11',
+        'x-openai-client-user-agent': '{"client":"openclaw"}',
+      },
+    })).toEqual({
+      clientKind: 'codex',
+      clientAppId: 'openclaw',
+      clientAppName: 'openclaw',
+      clientConfidence: 'exact',
+    });
+  });
+
+  it('treats explicit OpenClaw user-agent headers as self-reported app names', () => {
+    expect(detectDownstreamClientContext({
+      downstreamPath: '/v1/responses',
+      headers: {
+        'openai-beta': 'responses-2025-03-11',
+        'user-agent': 'OpenClaw/1.0',
+      },
+    })).toEqual({
+      clientKind: 'codex',
+      clientAppId: 'openclaw',
+      clientAppName: 'OpenClaw',
+      clientConfidence: 'exact',
+    });
+  });
+
   it('recognizes Claude Code requests from metadata.user_id without mutating the body', () => {
     const body = {
       model: 'claude-opus-4-6',

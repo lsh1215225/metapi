@@ -2,7 +2,7 @@ import { FastifyInstance } from 'fastify';
 import { db, schema } from '../../db/index.js';
 import { and, eq } from 'drizzle-orm';
 import { detectSite } from '../../services/siteDetector.js';
-import { invalidateSiteProxyCache } from '../../services/siteProxy.js';
+import { invalidateSiteProxyCache, parseSiteProxyUrlInput } from '../../services/siteProxy.js';
 import { formatUtcSqlDateTime } from '../../services/localTimeService.js';
 import { invalidateTokenRouterCache } from '../../services/tokenRouter.js';
 import { parseSiteCustomHeadersInput } from '../../services/siteCustomHeaders.js';
@@ -222,6 +222,7 @@ export async function sitesRoutes(app: FastifyInstance) {
     name: string;
     url: string;
     platform?: string;
+    proxyUrl?: string | null;
     useSystemProxy?: boolean;
     customHeaders?: string | null;
     externalCheckinUrl?: string | null;
@@ -230,7 +231,7 @@ export async function sitesRoutes(app: FastifyInstance) {
     sortOrder?: number;
     globalWeight?: number;
   } }>('/api/sites', async (request, reply) => {
-    const { name, url, platform, useSystemProxy, customHeaders, externalCheckinUrl, status, isPinned, sortOrder, globalWeight } = request.body;
+    const { name, url, platform, proxyUrl, useSystemProxy, customHeaders, externalCheckinUrl, status, isPinned, sortOrder, globalWeight } = request.body;
     const normalizedStatus = normalizeSiteStatus(status);
     if (status !== undefined && !normalizedStatus) {
       return reply.code(400).send({ error: 'Invalid site status. Expected active or disabled.' });
@@ -238,6 +239,10 @@ export async function sitesRoutes(app: FastifyInstance) {
     const normalizedUseSystemProxy = normalizeUseSystemProxyFlag(useSystemProxy);
     if (useSystemProxy !== undefined && normalizedUseSystemProxy === null) {
       return reply.code(400).send({ error: 'Invalid useSystemProxy value. Expected boolean.' });
+    }
+    const normalizedProxyUrl = parseSiteProxyUrlInput(proxyUrl);
+    if (!normalizedProxyUrl.valid) {
+      return reply.code(400).send({ error: 'Invalid proxyUrl. Expected a valid http(s)/socks proxy URL.' });
     }
     const normalizedExternalCheckinUrl = normalizeOptionalExternalCheckinUrl(externalCheckinUrl);
     if (!normalizedExternalCheckinUrl.valid) {
@@ -275,6 +280,7 @@ export async function sitesRoutes(app: FastifyInstance) {
       name,
       url: url.replace(/\/+$/, ''),
       platform: detectedPlatform,
+      proxyUrl: normalizedProxyUrl.proxyUrl,
       useSystemProxy: normalizedUseSystemProxy ?? false,
       customHeaders: normalizedCustomHeaders.customHeaders,
       externalCheckinUrl: normalizedExternalCheckinUrl.url,
@@ -300,6 +306,7 @@ export async function sitesRoutes(app: FastifyInstance) {
     name?: string;
     url?: string;
     platform?: string;
+    proxyUrl?: string | null;
     useSystemProxy?: boolean;
     customHeaders?: string | null;
     externalCheckinUrl?: string | null;
@@ -328,6 +335,10 @@ export async function sitesRoutes(app: FastifyInstance) {
     if (body.useSystemProxy !== undefined && normalizedUseSystemProxy === null) {
       return reply.code(400).send({ error: 'Invalid useSystemProxy value. Expected boolean.' });
     }
+    const normalizedProxyUrl = parseSiteProxyUrlInput(body.proxyUrl);
+    if (!normalizedProxyUrl.valid) {
+      return reply.code(400).send({ error: 'Invalid proxyUrl. Expected a valid http(s)/socks proxy URL.' });
+    }
     const normalizedExternalCheckinUrl = normalizeOptionalExternalCheckinUrl(body.externalCheckinUrl);
     if (!normalizedExternalCheckinUrl.valid) {
       return reply.code(400).send({ error: 'Invalid externalCheckinUrl. Expected a valid http(s) URL.' });
@@ -352,6 +363,7 @@ export async function sitesRoutes(app: FastifyInstance) {
     if (body.name !== undefined) updates.name = body.name;
     if (body.url !== undefined) updates.url = body.url.replace(/\/+$/, '');
     if (body.platform !== undefined) updates.platform = body.platform;
+    if (normalizedProxyUrl.present) updates.proxyUrl = normalizedProxyUrl.proxyUrl;
     if (body.useSystemProxy !== undefined) updates.useSystemProxy = normalizedUseSystemProxy;
     if (normalizedCustomHeaders.present) updates.customHeaders = normalizedCustomHeaders.customHeaders;
     if (normalizedExternalCheckinUrl.present) updates.externalCheckinUrl = normalizedExternalCheckinUrl.url;
@@ -483,6 +495,50 @@ export async function sitesRoutes(app: FastifyInstance) {
 
     invalidateSiteCaches();
     return { siteId: id, models: uniqueModels };
+  });
+
+  // Get all discovered models for a site (from model_availability and token_model_availability)
+  app.get<{ Params: { id: string } }>('/api/sites/:id/available-models', async (request, reply) => {
+    const id = parseInt(request.params.id);
+    if (Number.isNaN(id)) {
+      return reply.code(400).send({ error: 'Invalid site id' });
+    }
+    const existingSite = await db.select().from(schema.sites).where(eq(schema.sites.id, id)).get();
+    if (!existingSite) {
+      return reply.code(404).send({ error: 'Site not found' });
+    }
+
+    // Get models from model_availability (account-level)
+    const accountModels = await db.select({ modelName: schema.modelAvailability.modelName })
+      .from(schema.modelAvailability)
+      .innerJoin(schema.accounts, eq(schema.modelAvailability.accountId, schema.accounts.id))
+      .where(
+        and(
+          eq(schema.accounts.siteId, id),
+          eq(schema.modelAvailability.available, true),
+        ),
+      )
+      .all();
+
+    // Get models from token_model_availability (token-level)
+    const tokenModels = await db.select({ modelName: schema.tokenModelAvailability.modelName })
+      .from(schema.tokenModelAvailability)
+      .innerJoin(schema.accountTokens, eq(schema.tokenModelAvailability.tokenId, schema.accountTokens.id))
+      .innerJoin(schema.accounts, eq(schema.accountTokens.accountId, schema.accounts.id))
+      .where(
+        and(
+          eq(schema.accounts.siteId, id),
+          eq(schema.tokenModelAvailability.available, true),
+        ),
+      )
+      .all();
+
+    const models = Array.from(new Set([
+      ...accountModels.map((r) => r.modelName.trim()),
+      ...tokenModels.map((r) => r.modelName.trim()),
+    ])).filter((m) => m.length > 0).sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' }));
+
+    return { siteId: id, models };
   });
 
   // Detect platform for a URL

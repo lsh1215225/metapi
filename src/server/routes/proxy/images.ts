@@ -1,4 +1,4 @@
-﻿import { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
+import { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { fetch } from 'undici';
 import { tokenRouter } from '../../services/tokenRouter.js';
 import { refreshModelsAndRebuildRoutes } from '../../services/modelService.js';
@@ -8,6 +8,7 @@ import { estimateProxyCost } from '../../services/modelPricingService.js';
 import { shouldRetryProxyRequest } from '../../services/proxyRetryPolicy.js';
 import { ensureModelAllowedForDownstreamKey, getDownstreamRoutingPolicy, recordDownstreamCostUsage } from './downstreamPolicy.js';
 import { withSiteRecordProxyRequestInit } from '../../services/siteProxy.js';
+import { getProxyUrlFromExtraConfig } from '../../services/accountExtraConfig.js';
 import { composeProxyLogMessage } from './logPathMeta.js';
 import { formatUtcSqlDateTime } from '../../services/localTimeService.js';
 import { cloneFormDataWithOverrides, ensureMultipartBufferParser, parseMultipartFormData } from './multipart.js';
@@ -71,7 +72,7 @@ export async function imagesProxyRoute(app: FastifyInstance) {
             'Authorization': `Bearer ${selected.tokenValue}`,
           },
           body: JSON.stringify(forwardBody),
-        }));
+        }, getProxyUrlFromExtraConfig(selected.account.extraConfig)));
 
         const text = await upstream.text();
         if (!upstream.ok) {
@@ -218,7 +219,7 @@ export async function imagesProxyRoute(app: FastifyInstance) {
             body: cloneFormDataWithOverrides(multipartForm, {
               model: upstreamModel,
             }) as any,
-          })
+          }, getProxyUrlFromExtraConfig(selected.account.extraConfig))
           : withSiteRecordProxyRequestInit(selected.site, {
             method: 'POST',
             headers: {
@@ -229,7 +230,7 @@ export async function imagesProxyRoute(app: FastifyInstance) {
               ...(jsonBody || {}),
               model: upstreamModel,
             }),
-          });
+          }, getProxyUrlFromExtraConfig(selected.account.extraConfig));
 
         const upstream = await fetch(targetUrl, requestInit);
         const text = await upstream.text();
@@ -381,4 +382,3 @@ async function logProxy(
     console.warn('[proxy/images] failed to write proxy log', error);
   }
 }
-

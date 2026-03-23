@@ -196,6 +196,82 @@ describe('resolveUpstreamEndpointCandidates', () => {
     expect(order).toEqual(['responses', 'messages', 'chat']);
   });
 
+  it('does not apply runtime endpoint memory to image attachments', async () => {
+    recordUpstreamEndpointSuccess({
+      siteId: baseContext.site.id,
+      endpoint: 'responses',
+      downstreamFormat: 'openai',
+      modelName: 'gpt-5.3',
+      requestCapabilities: {
+        conversationFileSummary: {
+          hasImage: true,
+          hasAudio: false,
+          hasDocument: false,
+          hasRemoteDocumentUrl: false,
+        },
+      },
+    });
+
+    const order = await resolveUpstreamEndpointCandidates(
+      {
+        ...baseContext,
+        site: { ...baseContext.site, platform: 'new-api' },
+      },
+      'gpt-5.3',
+      'openai',
+      undefined,
+      {
+        conversationFileSummary: {
+          hasImage: true,
+          hasAudio: false,
+          hasDocument: false,
+          hasRemoteDocumentUrl: false,
+        },
+      },
+    );
+
+    expect(order).toEqual(['chat', 'messages', 'responses']);
+  });
+
+  it('does not apply runtime endpoint memory to document attachments', async () => {
+    recordUpstreamEndpointSuccess({
+      siteId: baseContext.site.id,
+      endpoint: 'messages',
+      downstreamFormat: 'openai',
+      modelName: 'gpt-5.3',
+      requestCapabilities: {
+        hasNonImageFileInput: true,
+        conversationFileSummary: {
+          hasImage: false,
+          hasAudio: false,
+          hasDocument: true,
+          hasRemoteDocumentUrl: false,
+        },
+      },
+    });
+
+    const order = await resolveUpstreamEndpointCandidates(
+      {
+        ...baseContext,
+        site: { ...baseContext.site, platform: 'new-api' },
+      },
+      'gpt-5.3',
+      'openai',
+      undefined,
+      {
+        hasNonImageFileInput: true,
+        conversationFileSummary: {
+          hasImage: false,
+          hasAudio: false,
+          hasDocument: true,
+          hasRemoteDocumentUrl: false,
+        },
+      },
+    );
+
+    expect(order).toEqual(['responses', 'messages', 'chat']);
+  });
+
   it('remembers the last successful endpoint per site capability profile', async () => {
     recordUpstreamEndpointSuccess({
       siteId: baseContext.site.id,
@@ -244,6 +320,87 @@ describe('resolveUpstreamEndpointCandidates', () => {
 
     expect(learnedOrder).toEqual(['responses', 'chat', 'messages']);
     expect(unrelatedModelOrder).toEqual(['chat', 'messages', 'responses']);
+  });
+
+  it('keeps remote-document-url requests on a separate runtime preference bucket from inline document requests', async () => {
+    recordUpstreamEndpointSuccess({
+      siteId: baseContext.site.id,
+      endpoint: 'chat',
+      downstreamFormat: 'openai',
+      modelName: 'gpt-5.3',
+      requestCapabilities: {
+        hasNonImageFileInput: true,
+        conversationFileSummary: {
+          hasImage: false,
+          hasAudio: false,
+          hasDocument: true,
+          hasRemoteDocumentUrl: false,
+        },
+      },
+    });
+
+    const order = await resolveUpstreamEndpointCandidates(
+      {
+        ...baseContext,
+        site: { ...baseContext.site, platform: 'new-api' },
+      },
+      'gpt-5.3',
+      'openai',
+      undefined,
+      {
+        hasNonImageFileInput: true,
+        conversationFileSummary: {
+          hasImage: false,
+          hasAudio: false,
+          hasDocument: true,
+          hasRemoteDocumentUrl: true,
+        },
+      },
+    );
+
+    expect(order).toEqual(['responses']);
+  });
+
+  it('does not remember messages fallback success for generic /v1/responses requests', async () => {
+    recordUpstreamEndpointSuccess({
+      siteId: baseContext.site.id,
+      endpoint: 'messages',
+      downstreamFormat: 'responses',
+      modelName: 'gpt-5.3',
+    });
+
+    const order = await resolveUpstreamEndpointCandidates(
+      {
+        ...baseContext,
+        site: { ...baseContext.site, platform: 'new-api' },
+      },
+      'gpt-5.3',
+      'responses',
+    );
+
+    expect(order).toEqual(['responses', 'chat', 'messages']);
+  });
+
+  it('does not block generic /v1/responses endpoints on transient upstream errors', async () => {
+    recordUpstreamEndpointFailure({
+      siteId: baseContext.site.id,
+      endpoint: 'responses',
+      downstreamFormat: 'responses',
+      modelName: 'gpt-5.3',
+      status: 504,
+      errorText: '{"error":{"message":"Gateway time-out","type":"upstream_error"}}',
+    });
+
+    const order = await resolveUpstreamEndpointCandidates(
+      {
+        ...baseContext,
+        site: { ...baseContext.site, platform: 'new-api' },
+      },
+      'gpt-5.3',
+      'responses',
+    );
+
+    expect(order).toEqual(['responses', 'chat', 'messages']);
   });
 
   it('learns a better endpoint from explicit upstream protocol errors', async () => {
@@ -530,7 +687,7 @@ describe('buildUpstreamEndpointRequest', () => {
     expect(request.body.prompt_cache_key).toBeUndefined();
   });
 
-  it('preserves explicit prompt_cache_key for native codex responses requests', () => {
+  it('preserves explicit prompt_cache_key for native codex responses requests without mapping it into codex session headers', () => {
     const request = buildUpstreamEndpointRequest({
       endpoint: 'responses',
       modelName: 'gpt-5.4',
@@ -548,11 +705,10 @@ describe('buildUpstreamEndpointRequest', () => {
       providerHeaders: {
         Originator: 'codex_cli_rs',
       },
-      codexExplicitSessionId: 'codex-cache-123',
     } as any);
 
-    expect(request.headers.Session_id).toBe('codex-cache-123');
-    expect(request.headers.Conversation_id).toBe('codex-cache-123');
+    expect(request.headers.Session_id).toMatch(/^[0-9a-f-]{36}$/i);
+    expect(request.headers.Conversation_id).toBeUndefined();
     expect(request.body.prompt_cache_key).toBe('codex-cache-123');
   });
 
@@ -813,10 +969,10 @@ describe('buildUpstreamEndpointRequest', () => {
     expect(request.headers['User-Agent']).toBe('claude-cli/2.1.63 (external, cli)');
     expect(request.headers.Connection).toBe('keep-alive');
     expect(request.headers.Accept).toBe('text/event-stream');
-    expect(request.headers['Accept-Encoding']).toBe('identity');
+    expect(request.headers['Accept-Encoding']).toBe('gzip, deflate, br, zstd');
   });
 
-  it('uses claude-code beta headers and compressed non-stream responses for claude upstream requests', () => {
+  it('uses claude-code beta headers and uncompressed non-stream responses for claude upstream requests', () => {
     const request = buildUpstreamEndpointRequest({
       endpoint: 'messages',
       modelName: 'claude-opus-4-6',
@@ -1750,6 +1906,79 @@ describe('buildUpstreamEndpointRequest', () => {
         ],
       },
     ]);
+  });
+
+  it('drops Responses-only tools when /v1/responses falls back to /v1/chat/completions', () => {
+    const request = buildUpstreamEndpointRequest({
+      endpoint: 'chat',
+      modelName: 'gpt-5.4',
+      stream: false,
+      tokenValue: 'sk-test',
+      sitePlatform: 'openai',
+      siteUrl: 'https://example.com',
+      downstreamFormat: 'responses',
+      openaiBody: {
+        model: 'gpt-5.4',
+        messages: [
+          {
+            role: 'user',
+            content: 'summarize the workspace state',
+          },
+        ],
+        tools: [
+          {
+            type: 'function',
+            function: {
+              name: 'Glob',
+              description: 'Search files',
+              parameters: {
+                type: 'object',
+                properties: {
+                  pattern: { type: 'string' },
+                },
+                required: ['pattern'],
+              },
+            },
+          },
+          {
+            type: 'custom',
+            name: 'browser',
+            format: { type: 'text' },
+          },
+          {
+            type: 'image_generation',
+            size: '1024x1024',
+          },
+        ],
+        tool_choice: {
+          type: 'custom',
+          name: 'browser',
+        },
+      },
+    });
+
+    expect(request.path).toBe('/v1/chat/completions');
+    expect(request.body).toMatchObject({
+      model: 'gpt-5.4',
+      stream: false,
+      tools: [
+        {
+          type: 'function',
+          function: {
+            name: 'Glob',
+            description: 'Search files',
+            parameters: {
+              type: 'object',
+              properties: {
+                pattern: { type: 'string' },
+              },
+              required: ['pattern'],
+            },
+          },
+        },
+      ],
+    });
+    expect(request.body.tool_choice).toBeUndefined();
   });
 
   it('preserves Anthropic image and tool_result blocks instead of flattening to plain text', () => {

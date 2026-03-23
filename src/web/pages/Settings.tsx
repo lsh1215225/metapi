@@ -3,6 +3,7 @@ import { createPortal } from 'react-dom';
 import { useNavigate } from 'react-router-dom';
 import { api } from '../api.js';
 import { useToast } from '../components/Toast.js';
+import { useIsMobile } from '../components/useIsMobile.js';
 import ChangeKeyModal from '../components/ChangeKeyModal.js';
 import { useAnimatedVisibility } from '../components/useAnimatedVisibility.js';
 import { BrandGlyph, InlineBrandIcon, getBrand, normalizeBrandIconKey } from '../components/BrandIcon.js';
@@ -53,7 +54,13 @@ type RuntimeSettings = {
   proxyTokenMasked?: string;
   adminIpAllowlist?: string[];
   currentAdminIp?: string;
+  globalBlockedBrands?: string[];
 };
+
+type SystemProxyTestState =
+  | { kind: 'success'; text: string }
+  | { kind: 'error'; text: string }
+  | null;
 
 type DownstreamApiKeyItem = {
   id: number;
@@ -199,6 +206,7 @@ function resolveRouteBrandSource(route: RouteSelectorItem): string {
 
 export default function Settings() {
   const navigate = useNavigate();
+  const isMobile = useIsMobile();
   const [runtime, setRuntime] = useState<RuntimeSettings>({
     checkinCron: '0 8 * * *',
     checkinScheduleMode: 'cron',
@@ -222,9 +230,14 @@ export default function Settings() {
   const [testingCheckin, setTestingCheckin] = useState(false);
   const [savingToken, setSavingToken] = useState(false);
   const [savingSystemProxy, setSavingSystemProxy] = useState(false);
+  const [testingSystemProxy, setTestingSystemProxy] = useState(false);
+  const [systemProxyTestState, setSystemProxyTestState] = useState<SystemProxyTestState>(null);
   const [savingProxyFailureRules, setSavingProxyFailureRules] = useState(false);
   const [savingRouting, setSavingRouting] = useState(false);
   const [showAdvancedRouting, setShowAdvancedRouting] = useState(false);
+  const [allBrandNames, setAllBrandNames] = useState<string[] | null>(null);
+  const [blockedBrands, setBlockedBrands] = useState<string[]>([]);
+  const [savingBrandFilter, setSavingBrandFilter] = useState(false);
   const [savingSecurity, setSavingSecurity] = useState(false);
   const [adminIpAllowlistText, setAdminIpAllowlistText] = useState('');
   const [clearingCache, setClearingCache] = useState(false);
@@ -442,7 +455,9 @@ export default function Settings() {
           ? runtimeInfo.adminIpAllowlist.filter((item: unknown) => typeof item === 'string')
           : [],
         currentAdminIp: typeof runtimeInfo.currentAdminIp === 'string' ? runtimeInfo.currentAdminIp : '',
+        globalBlockedBrands: Array.isArray(runtimeInfo.globalBlockedBrands) ? runtimeInfo.globalBlockedBrands : [],
       });
+      setBlockedBrands(Array.isArray(runtimeInfo.globalBlockedBrands) ? runtimeInfo.globalBlockedBrands : []);
       setProxyErrorKeywordsText(
         Array.isArray(runtimeInfo.proxyErrorKeywords)
           ? runtimeInfo.proxyErrorKeywords.filter((item: unknown) => typeof item === 'string').join('\n')
@@ -485,6 +500,10 @@ export default function Settings() {
     } finally {
       setLoading(false);
     }
+    // Load brand list in background (non-blocking, best-effort)
+    api.getBrandList()
+      .then((res: any) => setAllBrandNames(Array.isArray(res?.brands) ? res.brands : []))
+      .catch(() => setAllBrandNames([]));
   };
 
   useEffect(() => {
@@ -573,6 +592,31 @@ export default function Settings() {
       toast.error(err?.message || '保存失败');
     } finally {
       setSavingSystemProxy(false);
+    }
+  };
+
+  const testSystemProxy = async () => {
+    const proxyUrl = runtime.systemProxyUrl.trim();
+    if (!proxyUrl) {
+      const message = '请先填写系统代理地址';
+      setSystemProxyTestState({ kind: 'error', text: message });
+      toast.info(message);
+      return;
+    }
+
+    setTestingSystemProxy(true);
+    setSystemProxyTestState(null);
+    try {
+      const res = await api.testSystemProxy({ proxyUrl });
+      const summary = `连通成功，延迟 ${res.latencyMs} ms`;
+      setSystemProxyTestState({ kind: 'success', text: summary });
+      toast.success(`系统代理测试成功（${res.latencyMs} ms）`);
+    } catch (err: any) {
+      const message = err?.message || '系统代理测试失败';
+      setSystemProxyTestState({ kind: 'error', text: message });
+      toast.error(message);
+    } finally {
+      setTestingSystemProxy(false);
     }
   };
 
@@ -782,6 +826,27 @@ export default function Settings() {
     }));
   };
 
+  const handleSaveBrandFilter = async () => {
+    setSavingBrandFilter(true);
+    try {
+      const res = await api.updateRuntimeSettings({ globalBlockedBrands: blockedBrands });
+      const resolved = Array.isArray(res?.globalBlockedBrands) ? res.globalBlockedBrands : blockedBrands;
+      setRuntime((prev) => ({ ...prev, globalBlockedBrands: resolved }));
+      setBlockedBrands(resolved);
+      toast.success('品牌屏蔽设置已保存');
+      try {
+        await api.rebuildRoutes(false);
+        toast.success('路由已重建');
+      } catch {
+        toast.error('品牌屏蔽已保存，但路由重建失败，请手动重建');
+      }
+    } catch (err: any) {
+      toast.error(err?.message || '保存品牌屏蔽设置失败');
+    } finally {
+      setSavingBrandFilter(false);
+    }
+  };
+
   const saveSecuritySettings = async () => {
     setSavingSecurity(true);
     try {
@@ -988,7 +1053,7 @@ export default function Settings() {
 
         <div className="card animate-slide-up stagger-2" style={{ padding: 20 }}>
           <div style={{ fontWeight: 600, fontSize: 14, marginBottom: 12 }}>定时任务</div>
-          <div style={{ display: 'grid', gridTemplateColumns: '180px 180px auto', gap: 12, alignItems: 'end', marginBottom: 12 }}>
+          <div style={{ display: 'grid', gridTemplateColumns: isMobile ? '1fr' : '180px 180px auto', gap: 12, alignItems: 'end', marginBottom: 12 }}>
             <div>
               <div style={{ fontSize: 12, color: 'var(--color-text-muted)', marginBottom: 6 }}>签到方式</div>
               <ModernSelect
@@ -1021,7 +1086,7 @@ export default function Settings() {
               {testingCheckin ? '触发中...' : '测试一次签到'}
             </button>
           </div>
-          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
+          <div style={{ display: 'grid', gridTemplateColumns: isMobile ? '1fr' : '1fr 1fr', gap: 12 }}>
             <div>
               <div style={{ fontSize: 12, color: 'var(--color-text-muted)', marginBottom: 6 }}>签到 Cron</div>
               <input
@@ -1050,7 +1115,7 @@ export default function Settings() {
             }}
           >
             <div style={{ fontWeight: 600, fontSize: 13 }}>自动清理日志</div>
-            <div style={{ display: 'grid', gridTemplateColumns: '1fr 160px', gap: 12 }}>
+            <div style={{ display: 'grid', gridTemplateColumns: isMobile ? '1fr' : '1fr 160px', gap: 12 }}>
               <div>
                 <div style={{ fontSize: 12, color: 'var(--color-text-muted)', marginBottom: 6 }}>清理 Cron</div>
                 <input
@@ -1114,13 +1179,39 @@ export default function Settings() {
           </div>
           <input
             value={runtime.systemProxyUrl}
-            onChange={(e) => setRuntime((prev) => ({ ...prev, systemProxyUrl: e.target.value }))}
+            onChange={(e) => {
+              setRuntime((prev) => ({ ...prev, systemProxyUrl: e.target.value }));
+              setSystemProxyTestState(null);
+            }}
             placeholder="系统代理 URL（可选，如 http://127.0.0.1:7890 或 socks5://127.0.0.1:1080）"
             style={{ ...inputStyle, fontFamily: 'var(--font-mono)', marginBottom: 10 }}
           />
-          <button onClick={saveSystemProxy} disabled={savingSystemProxy} className="btn btn-primary">
-            {savingSystemProxy ? <><span className="spinner spinner-sm" style={{ borderTopColor: 'white', borderColor: 'rgba(255,255,255,0.3)' }} /> 保存中...</> : '保存系统代理'}
-          </button>
+          <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', alignItems: 'center' }}>
+            <button onClick={saveSystemProxy} disabled={savingSystemProxy} className="btn btn-primary">
+              {savingSystemProxy ? <><span className="spinner spinner-sm" style={{ borderTopColor: 'white', borderColor: 'rgba(255,255,255,0.3)' }} /> 保存中...</> : '保存系统代理'}
+            </button>
+            <button
+              onClick={testSystemProxy}
+              disabled={testingSystemProxy}
+              className="btn btn-ghost"
+              style={{ border: '1px solid var(--color-border)' }}
+            >
+              {testingSystemProxy ? <><span className="spinner spinner-sm" /> 测试中...</> : '测试系统代理'}
+            </button>
+          </div>
+          {systemProxyTestState && (
+            <div
+              style={{
+                fontSize: 12,
+                marginTop: 10,
+                color: systemProxyTestState.kind === 'success'
+                  ? 'var(--color-success)'
+                  : 'var(--color-danger)',
+              }}
+            >
+              {systemProxyTestState.text}
+            </div>
+          )}
         </div>
 
         <div className="card animate-slide-up stagger-4" style={{ padding: 20 }}>
@@ -1326,7 +1417,7 @@ export default function Settings() {
 
           <div className={`anim-collapse ${showAdvancedRouting ? 'is-open' : ''}`.trim()}>
             <div className="anim-collapse-inner" style={{ paddingTop: 2 }}>
-              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
+              <div style={{ display: 'grid', gridTemplateColumns: isMobile ? '1fr' : '1fr 1fr', gap: 12 }}>
               {([
                 ['baseWeightFactor', '基础权重因子'],
                 ['valueScoreFactor', '价值分因子'],
@@ -1366,13 +1457,62 @@ export default function Settings() {
           </div>
         </div>
 
+        {/* Global Brand Filter */}
         <div className="card animate-slide-up stagger-6" style={{ padding: 20 }}>
+          <div style={{ fontWeight: 600, fontSize: 14, marginBottom: 8 }}>全局品牌屏蔽</div>
+          <div style={{ fontSize: 12, color: 'var(--color-text-muted)', marginBottom: 12, lineHeight: 1.6 }}>
+            屏蔽选定品牌后，路由重建时将自动跳过匹配该品牌的所有模型。点击品牌切换屏蔽状态，保存后自动触发路由重建。
+          </div>
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginBottom: 12 }}>
+            {(allBrandNames || []).map((brand) => {
+              const isBlocked = blockedBrands.includes(brand);
+              return (
+                <button
+                  key={brand}
+                  type="button"
+                  role="switch"
+                  aria-checked={isBlocked}
+                  onClick={() => {
+                    if (isBlocked) {
+                      setBlockedBrands((prev) => prev.filter((b) => b !== brand));
+                    } else {
+                      setBlockedBrands((prev) => [...prev, brand]);
+                    }
+                  }}
+                  className={`badge ${isBlocked ? 'badge-warning' : 'badge-muted'}`}
+                  style={{
+                    fontSize: 12, cursor: 'pointer', border: 'none', padding: '5px 12px',
+                    transition: 'all 0.15s ease',
+                  }}
+                >
+                  {brand}
+                </button>
+              );
+            })}
+            {allBrandNames === null && (
+              <span style={{ fontSize: 12, color: 'var(--color-text-muted)' }}>加载品牌列表中...</span>
+            )}
+            {allBrandNames !== null && allBrandNames.length === 0 && (
+              <span style={{ fontSize: 12, color: 'var(--color-text-muted)' }}>暂无可用品牌</span>
+            )}
+          </div>
+          {blockedBrands.length > 0 && (
+            <div style={{ fontSize: 12, color: 'var(--color-warning)', marginBottom: 10 }}>
+              已屏蔽 {blockedBrands.length} 个品牌：{blockedBrands.join('、')}
+            </div>
+          )}
+          <button onClick={handleSaveBrandFilter} disabled={savingBrandFilter} className="btn btn-primary" style={{ fontSize: 12, padding: '6px 16px' }}>
+            {savingBrandFilter ? <><span className="spinner spinner-sm" style={{ borderTopColor: 'white', borderColor: 'rgba(255,255,255,0.3)' }} /> 保存中...</> : '保存品牌屏蔽'}
+          </button>
+        </div>
+
+        <div className="card animate-slide-up stagger-7" style={{ padding: 20 }}>
           <div style={{ fontWeight: 600, fontSize: 14, marginBottom: 10 }}>数据库迁移（SQLite / MySQL / PostgreSQL）</div>
           <div style={{ fontSize: 12, color: 'var(--color-text-muted)', marginBottom: 12 }}>
             可先测试连接，再迁移数据；迁移完成后可保存为运行数据库配置（重启容器后生效）。
           </div>
 
-          <div style={{ display: 'grid', gridTemplateColumns: '180px 1fr', gap: 10, marginBottom: 10, alignItems: 'center' }}>
+          <div style={{ display: 'grid', gridTemplateColumns: isMobile ? '1fr' : '180px 1fr', gap: 10, marginBottom: 10, alignItems: 'center' }}>
             <ModernSelect
               value={migrationDialect}
               onChange={(value) => setMigrationDialect(value as DbDialect)}
@@ -1413,7 +1553,7 @@ export default function Settings() {
             />
           ) : (
             <div style={{ marginBottom: 10 }}>
-              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 10, marginBottom: 8 }}>
+              <div style={{ display: 'grid', gridTemplateColumns: isMobile ? '1fr' : '1fr 1fr 1fr', gap: 10, marginBottom: 8 }}>
                 <input
                   value={shorthandConnection.host}
                   onChange={(e) => setShorthandConnection((prev) => ({ ...prev, host: e.target.value }))}
@@ -1444,7 +1584,7 @@ export default function Settings() {
                 </button>
               </div>
               {showShorthandOptional && (
-                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10, marginBottom: 8 }}>
+                <div style={{ display: 'grid', gridTemplateColumns: isMobile ? '1fr' : '1fr 1fr', gap: 10, marginBottom: 8 }}>
                   <input
                     value={shorthandConnection.port}
                     onChange={(e) => setShorthandConnection((prev) => ({ ...prev, port: e.target.value }))}

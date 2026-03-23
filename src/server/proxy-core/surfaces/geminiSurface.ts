@@ -9,7 +9,8 @@ import { isModelAllowedByPolicyOrAllowedRoutes } from '../../services/downstream
 import { tokenRouter } from '../../services/tokenRouter.js';
 import { buildOauthProviderHeaders } from '../../services/oauth/service.js';
 import { getOauthInfoFromExtraConfig } from '../../services/oauth/oauthAccount.js';
-import { withSiteProxyRequestInit } from '../../services/siteProxy.js';
+import { refreshOauthAccessTokenSingleflight } from '../../services/oauth/refreshSingleflight.js';
+import { resolveChannelProxyUrl, withSiteRecordProxyRequestInit } from '../../services/siteProxy.js';
 import { refreshModelsAndRebuildRoutes } from '../../services/modelService.js';
 import { getDownstreamRoutingPolicy } from '../../routes/proxy/downstreamPolicy.js';
 import { executeEndpointFlow, type BuiltEndpointRequest } from '../../routes/proxy/endpointFlow.js';
@@ -33,6 +34,8 @@ import {
 import { dispatchRuntimeRequest } from '../../routes/proxy/runtimeExecutor.js';
 import { detectDownstreamClientContext, type DownstreamClientContext } from '../../routes/proxy/downstreamClientContext.js';
 import { insertProxyLog } from '../../services/proxyLogStore.js';
+import { summarizeConversationFileInputsInOpenAiBody } from '../capabilities/conversationFileCapabilities.js';
+import { readRuntimeResponseText } from '../executors/types.js';
 
 const MAX_RETRIES = 2;
 const GEMINI_MODEL_PROBES = [
@@ -293,7 +296,7 @@ export async function geminiProxyRoute(app: FastifyInstance) {
           geminiGenerateContentTransformer.resolveModelsUrl(selected.site.url, apiVersion, selected.tokenValue),
           { method: 'GET' },
         );
-        const text = await upstream.text();
+        const text = await readRuntimeResponseText(upstream);
         if (!upstream.ok) {
           lastStatus = upstream.status;
           lastText = text;
@@ -365,6 +368,11 @@ export async function geminiProxyRoute(app: FastifyInstance) {
     const isCountTokensAction = isGeminiCliDownstream
       ? options?.action === 'countTokens'
       : modelActionPath.endsWith(':countTokens');
+    const rawUrl = request.raw.url || request.url || '';
+    const wantsSseEnvelope = (
+      isStreamAction
+      && (isGeminiCliDownstream || /(?:^|[?&])alt=sse(?:&|$)/i.test(rawUrl))
+    );
     if (!requestedModel) {
       return reply.code(400).send({
         error: { message: 'Gemini model path is required', type: 'invalid_request_error' },
@@ -399,7 +407,7 @@ export async function geminiProxyRoute(app: FastifyInstance) {
         isGeminiCliDownstream ? omitGeminiCliModelField(request.body) : (request.body || {}),
         actualModel,
       );
-      const oauth = getOauthInfoFromExtraConfig(selected.account.extraConfig);
+      let oauth = getOauthInfoFromExtraConfig(selected.account.extraConfig);
       const isGeminiCli = isGeminiCliPlatform(selected.site.platform);
       const isInternalGemini = isInternalGeminiPlatform(selected.site.platform);
       const isDirectGeminiFamily = isDirectGeminiFamilyPlatform(selected.site.platform);
@@ -436,74 +444,96 @@ export async function geminiProxyRoute(app: FastifyInstance) {
             ? buildGeminiCliActionPath({ isStreamAction, isCountTokensAction })
             : resolveUpstreamPath(apiVersion, actualModelAction);
           const query = new URLSearchParams(request.query as Record<string, string>).toString();
-          const requestBody = isInternalGemini
-            ? (
-              isCountTokensAction
-                ? { request: normalizedBody }
-                : wrapGeminiCliRequest({
-                  modelName: actualModel,
-                  projectId: oauth?.projectId || '',
-                  request: normalizedBody as Record<string, unknown>,
-                })
-            )
-            : normalizedBody;
-          const requestHeaders = isInternalGemini
-            ? {
-              'Content-Type': 'application/json',
-              ...(isStreamAction ? { Accept: 'text/event-stream' } : {}),
-              Authorization: `Bearer ${selected.tokenValue}`,
-              ...buildOauthProviderHeaders({
-                extraConfig: typeof selected.account.extraConfig === 'string' ? selected.account.extraConfig : null,
-                downstreamHeaders: request.headers as Record<string, unknown>,
-              }),
-            }
-            : {
-              'Content-Type': 'application/json',
-            };
-          const targetUrl = isInternalGemini
-            ? `${selected.site.url}${upstreamPath}`
-            : geminiGenerateContentTransformer.resolveActionUrl(
-              selected.site.url,
-              apiVersion,
-              actualModelAction,
-              selected.tokenValue,
-              query,
-            );
-          const upstream = isInternalGemini
-            ? await dispatchRuntimeRequest({
-              siteUrl: selected.site.url,
-              targetUrl,
-              request: {
-                endpoint: 'chat',
-                path: upstreamPath,
-                headers: requestHeaders,
-                body: requestBody as Record<string, unknown>,
-                runtime: {
-                  executor: isGeminiCli ? 'gemini-cli' : 'antigravity',
-                  modelName: actualModel,
-                  stream: isStreamAction,
-                  oauthProjectId: oauth?.projectId || null,
-                  action: isCountTokensAction
-                    ? 'countTokens'
-                    : (isStreamAction ? 'streamGenerateContent' : 'generateContent'),
+          const channelProxyUrl = resolveChannelProxyUrl(selected.site, selected.account.extraConfig);
+          const dispatchSelectedRequest = async () => {
+            const requestBody = isInternalGemini
+              ? (
+                isCountTokensAction
+                  ? { request: normalizedBody }
+                  : wrapGeminiCliRequest({
+                    modelName: actualModel,
+                    projectId: oauth?.projectId || '',
+                    request: normalizedBody as Record<string, unknown>,
+                  })
+              )
+              : normalizedBody;
+            const requestHeaders = isInternalGemini
+              ? {
+                'Content-Type': 'application/json',
+                ...(isStreamAction ? { Accept: 'text/event-stream' } : {}),
+                Authorization: `Bearer ${selected.tokenValue}`,
+                ...buildOauthProviderHeaders({
+                  extraConfig: typeof selected.account.extraConfig === 'string' ? selected.account.extraConfig : null,
+                  downstreamHeaders: request.headers as Record<string, unknown>,
+                }),
+              }
+              : {
+                'Content-Type': 'application/json',
+              };
+            const targetUrl = isInternalGemini
+              ? `${selected.site.url}${upstreamPath}`
+              : geminiGenerateContentTransformer.resolveActionUrl(
+                selected.site.url,
+                apiVersion,
+                actualModelAction,
+                selected.tokenValue,
+                query,
+              );
+
+            return isInternalGemini
+              ? dispatchRuntimeRequest({
+                siteUrl: selected.site.url,
+                targetUrl,
+                request: {
+                  endpoint: 'chat',
+                  path: upstreamPath,
+                  headers: requestHeaders,
+                  body: requestBody as Record<string, unknown>,
+                  runtime: {
+                    executor: isGeminiCli ? 'gemini-cli' : 'antigravity',
+                    modelName: actualModel,
+                    stream: isStreamAction,
+                    oauthProjectId: oauth?.projectId || null,
+                    action: isCountTokensAction
+                      ? 'countTokens'
+                      : (isStreamAction ? 'streamGenerateContent' : 'generateContent'),
+                  },
                 },
-              },
-              buildInit: async (requestUrl, requestForFetch) => withSiteProxyRequestInit(requestUrl, {
+                buildInit: async (_requestUrl, requestForFetch) => withSiteRecordProxyRequestInit(selected.site, {
+                  method: 'POST',
+                  headers: requestForFetch.headers,
+                  body: JSON.stringify(requestForFetch.body),
+                }, channelProxyUrl),
+              })
+              : fetch(targetUrl, {
                 method: 'POST',
-                headers: requestForFetch.headers,
-                body: JSON.stringify(requestForFetch.body),
-              }),
-            })
-            : await fetch(targetUrl, {
-              method: 'POST',
-              headers: requestHeaders,
-              body: JSON.stringify(requestBody),
-            });
-          const contentType = upstream.headers.get('content-type') || 'application/json';
+                headers: requestHeaders,
+                body: JSON.stringify(requestBody),
+              });
+          };
+
+          let upstream = await dispatchSelectedRequest();
+          let contentType = upstream.headers.get('content-type') || 'application/json';
+          if (upstream.status === 401 && oauth) {
+            try {
+              const refreshed = await refreshOauthAccessTokenSingleflight(selected.account.id);
+              selected.tokenValue = refreshed.accessToken;
+              selected.account = {
+                ...selected.account,
+                accessToken: refreshed.accessToken,
+                extraConfig: refreshed.extraConfig ?? selected.account.extraConfig,
+              };
+              oauth = getOauthInfoFromExtraConfig(selected.account.extraConfig);
+              upstream = await dispatchSelectedRequest();
+              contentType = upstream.headers.get('content-type') || 'application/json';
+            } catch {
+              // Preserve the original 401 response when refresh fails.
+            }
+          }
           if (!upstream.ok) {
             lastStatus = upstream.status;
             lastContentType = contentType;
-            lastText = await upstream.text();
+            lastText = await readRuntimeResponseText(upstream);
             await tokenRouter.recordFailure?.(selected.channel.id, {
               status: upstream.status,
               errorText: lastText,
@@ -611,7 +641,7 @@ export async function geminiProxyRoute(app: FastifyInstance) {
             return;
           }
 
-          const text = await upstream.text();
+          const text = await readRuntimeResponseText(upstream);
           const aggregateState = geminiGenerateContentTransformer.stream.createAggregateState();
           let parsedUsage = EMPTY_PROXY_USAGE;
           try {
@@ -685,6 +715,8 @@ export async function geminiProxyRoute(app: FastifyInstance) {
           modelName: actualModel,
           stream: isStreamAction,
         });
+        const conversationFileSummary = summarizeConversationFileInputsInOpenAiBody(openAiBody);
+        const hasNonImageFileInput = conversationFileSummary.hasDocument;
         const endpointCandidates = await resolveUpstreamEndpointCandidates(
           {
             site: selected.site,
@@ -693,12 +725,20 @@ export async function geminiProxyRoute(app: FastifyInstance) {
           actualModel,
           'openai',
           requestedModel,
+          {
+            hasNonImageFileInput,
+            conversationFileSummary,
+          },
         );
         const endpointRuntimeContext = {
           siteId: selected.site.id,
           modelName: actualModel,
           downstreamFormat: 'openai' as const,
           requestedModelHint: requestedModel,
+          requestCapabilities: {
+            hasNonImageFileInput,
+            conversationFileSummary,
+          },
         };
         const buildEndpointRequest = (
           endpoint: 'chat' | 'messages' | 'responses',
@@ -730,16 +770,17 @@ export async function geminiProxyRoute(app: FastifyInstance) {
             runtime: endpointRequest.runtime,
           };
         };
+        const channelProxyUrl = resolveChannelProxyUrl(selected.site, selected.account.extraConfig);
         const dispatchRequest = (compatibilityRequest: BuiltEndpointRequest, targetUrl?: string) => (
           dispatchRuntimeRequest({
             siteUrl: selected.site.url,
             targetUrl,
             request: compatibilityRequest,
-            buildInit: async (requestUrl, requestForFetch) => withSiteProxyRequestInit(requestUrl, {
+            buildInit: async (_requestUrl, requestForFetch) => withSiteRecordProxyRequestInit(selected.site, {
               method: 'POST',
               headers: requestForFetch.headers,
               body: JSON.stringify(requestForFetch.body),
-            }),
+            }, channelProxyUrl),
           })
         );
         const endpointStrategy = createChatEndpointStrategy({
@@ -811,7 +852,7 @@ export async function geminiProxyRoute(app: FastifyInstance) {
 
         upstreamPath = endpointResult.upstreamPath;
         const upstream = endpointResult.upstream;
-        const rawText = await upstream.text();
+        const rawText = await readRuntimeResponseText(upstream);
         let upstreamData: unknown = rawText;
         try {
           upstreamData = JSON.parse(rawText);
@@ -843,11 +884,18 @@ export async function geminiProxyRoute(app: FastifyInstance) {
           parsedUsage.completionTokens,
           parsedUsage.totalTokens,
         );
-        return reply.code(upstream.status).send(
-          isGeminiCliDownstream
-            ? { response: geminiResponse }
-            : geminiResponse,
-        );
+        const downstreamPayload = isGeminiCliDownstream
+          ? { response: geminiResponse }
+          : geminiResponse;
+        if (wantsSseEnvelope) {
+          // Some compatibility upstreams finish stream requests with a final JSON payload.
+          // Preserve Gemini streaming UX by wrapping that terminal payload back into one SSE event.
+          return reply
+            .code(upstream.status)
+            .type('text/event-stream; charset=utf-8')
+            .send(geminiGenerateContentTransformer.stream.serializeSsePayload(downstreamPayload));
+        }
+        return reply.code(upstream.status).send(downstreamPayload);
       } catch (error) {
         lastStatus = 502;
         lastContentType = 'application/json';
