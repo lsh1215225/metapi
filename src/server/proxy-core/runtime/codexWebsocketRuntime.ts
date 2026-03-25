@@ -80,7 +80,6 @@ export class CodexWebsocketRuntimeError extends Error {
   events: Array<Record<string, unknown>>;
   status?: number;
   payload?: unknown;
-  retryableStaleSession?: boolean;
 
   constructor(
     message: string,
@@ -88,7 +87,6 @@ export class CodexWebsocketRuntimeError extends Error {
       events?: Array<Record<string, unknown>>;
       status?: number;
       payload?: unknown;
-      retryableStaleSession?: boolean;
     },
   ) {
     super(message);
@@ -96,7 +94,6 @@ export class CodexWebsocketRuntimeError extends Error {
     this.events = options?.events ?? [];
     this.status = options?.status;
     this.payload = options?.payload;
-    this.retryableStaleSession = options?.retryableStaleSession;
   }
 }
 
@@ -251,14 +248,11 @@ async function sendSessionRequest(
       socket.off('close', onClose);
     };
 
-    const rejectWith = (message: string, options?: { retryableStaleSession?: boolean }) => {
+    const rejectWith = (message: string) => {
       if (settled) return;
       settled = true;
       cleanup();
-      reject(new CodexWebsocketRuntimeError(message, {
-        events: [...events],
-        retryableStaleSession: options?.retryableStaleSession,
-      }));
+      reject(new CodexWebsocketRuntimeError(message, { events: [...events] }));
     };
 
     const onMessage = (payload: WebSocket.RawData) => {
@@ -293,16 +287,12 @@ async function sendSessionRequest(
 
     const onError = (error: Error) => {
       clearSessionSocket(session, socket);
-      rejectWith(error.message || 'upstream websocket error', {
-        retryableStaleSession: reusedSession && events.length === 0,
-      });
+      rejectWith(error.message || 'upstream websocket error');
     };
 
     const onClose = () => {
       clearSessionSocket(session, socket);
-      rejectWith('stream closed before response.completed', {
-        retryableStaleSession: reusedSession && events.length === 0,
-      });
+      rejectWith('stream closed before response.completed');
     };
 
     socket.on('message', onMessage);
@@ -312,9 +302,7 @@ async function sendSessionRequest(
     socket.send(JSON.stringify(buildCodexWebsocketRequestBody(input.body)), (error) => {
       if (!error) return;
       clearSessionSocket(session, socket);
-      rejectWith(error.message || 'failed to send upstream websocket request', {
-        retryableStaleSession: reusedSession && events.length === 0,
-      });
+      rejectWith(error.message || 'failed to send upstream websocket request');
     });
   });
 }
@@ -332,19 +320,9 @@ export function createCodexWebsocketRuntime(input?: {
       }
 
       const session = sessionStore.getOrCreate(sessionId);
-      const runSend = async () => {
-        try {
-          return await sendSessionRequest(session, payload);
-        } catch (error) {
-          if (!(error instanceof CodexWebsocketRuntimeError) || !error.retryableStaleSession) {
-            throw error;
-          }
-          return await sendSessionRequest(session, payload);
-        }
-      };
       const run = session.queue
         .catch(() => undefined)
-        .then(() => runSend());
+        .then(() => sendSessionRequest(session, payload));
       session.queue = run.then(() => undefined, () => undefined);
       return run;
     },

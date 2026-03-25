@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { act, create, type ReactTestInstance } from 'react-test-renderer';
+import { act, create, type ReactTestInstance, type ReactTestRenderer } from 'react-test-renderer';
 import { MemoryRouter } from 'react-router-dom';
 import { ToastProvider } from '../components/Toast.js';
 import Settings from './Settings.js';
@@ -83,7 +83,7 @@ describe('Settings proxy transport', () => {
   });
 
   it('saves codex upstream websocket and session lease settings from the settings page', async () => {
-    let root!: WebTestRenderer;
+    let root!: ReactTestRenderer;
     try {
       await act(async () => {
         root = create(

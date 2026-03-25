@@ -268,7 +268,7 @@ describe('codexWebsocketRuntime', () => {
     await runtime.closeSession('exec-session-failed-turn');
   });
 
-  it('retries once with a fresh websocket when a reused session closes before yielding any events', async () => {
+  it('fails the current turn and opens a fresh websocket on the next turn when a reused session closes before yielding any events', async () => {
     upstreamMessageHandler = (socket, parsed, requestIndex) => {
       if (requestIndex === 1) {
         socket.send(JSON.stringify({
@@ -326,6 +326,20 @@ describe('codexWebsocketRuntime', () => {
         input: [],
       },
     });
+
+    await expect(runtime.sendRequest({
+      sessionId: 'exec-session-retry-stale',
+      requestUrl: upstreamWsUrl,
+      headers: {
+        Authorization: 'Bearer oauth-access-token',
+        'OpenAI-Beta': 'responses_websockets=2026-02-06',
+      },
+      body: {
+        model: 'gpt-5.4',
+        previous_response_id: 'resp-1',
+        input: [],
+      },
+    })).rejects.toThrow('stream closed before response.completed');
 
     const recovered = await runtime.sendRequest({
       sessionId: 'exec-session-retry-stale',

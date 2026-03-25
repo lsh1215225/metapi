@@ -1268,6 +1268,9 @@ export default function Settings() {
             默认采用 HTTP 优先。只有这里开启后，metapi 才会在 Codex 请求上尝试把上游升级为 WebSocket。
             下游 Codex 客户端也必须同时启用 `/v1/responses` websocket，单开这里不会生效。
           </div>
+          <div style={{ fontSize: 12, color: 'var(--color-text-muted)', marginBottom: 12, lineHeight: 1.7 }}>
+            从旧版本升级时，原先账号 `extraConfig.websockets` 的行为不再单独生效；现在统一以这里的全局设置和下游客户端是否开启为准。
+          </div>
           <label style={{ display: 'inline-flex', alignItems: 'center', gap: 8, fontSize: 13, color: 'var(--color-text-secondary)', marginBottom: 14 }}>
             <input
               type="checkbox"
